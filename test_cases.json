@@ -1,0 +1,85 @@
+{
+  "meta": {
+    "version": "1.0",
+    "description": "Token 接口测试用例 — 持久化定义，可复现"
+  },
+  "cases": [
+    {
+      "id": "TC-01",
+      "name": "接口连通性",
+      "type": "功能",
+      "input": "有效 URL + Key 发起单次请求",
+      "expected": "HTTP 200 且返回 usage",
+      "method": "connectivity",
+      "params": {
+        "max_tokens": 50,
+        "messages": [
+          {"role": "user", "content": "Hello, reply with just 'OK'."}
+        ]
+      }
+    },
+    {
+      "id": "TC-02",
+      "name": "TPS 压测",
+      "type": "性能",
+      "input": "并发={{concurrency}} 总请求={{total_requests}}",
+      "expected": "TPS/TPM 数值有效，成功率>0",
+      "method": "tps_benchmark",
+      "params": {
+        "concurrency": 4,
+        "total_requests": 20,
+        "max_tokens": 100,
+        "messages": [
+          {"role": "user", "content": "Say hello in one word."}
+        ]
+      }
+    },
+    {
+      "id": "TC-03",
+      "name": "TPM 换算",
+      "type": "性能",
+      "input": "基于 TPS 窗口换算每分钟吞吐",
+      "expected": "TPM = TPS × 60",
+      "method": "tpm_calc",
+      "params": {}
+    },
+    {
+      "id": "TC-04",
+      "name": "512k 上下文验收",
+      "type": "容量",
+      "input": "发送约 512000 tokens 长上下文",
+      "expected": "接口正常返回，未报上下文超限",
+      "method": "context_limit",
+      "params": {
+        "target_tokens": 512000,
+        "max_output_tokens": 50,
+        "prompt_template": "请总结以下文本的开头3个字和结尾3个字，用英文回复: {padding}"
+      }
+    },
+    {
+      "id": "TC-05",
+      "name": "鉴权失败",
+      "type": "异常",
+      "input": "无效/缺失 Key",
+      "expected": "返回 401/403，用例标记为失败",
+      "method": "auth_failure",
+      "params": {
+        "use_invalid_key": true
+      }
+    },
+    {
+      "id": "TC-06",
+      "name": "限流/超时",
+      "type": "异常",
+      "input": "高频并发触发 429 或超时",
+      "expected": "记录错误且不影响整体失败统计",
+      "method": "rate_limit",
+      "params": {
+        "concurrency": 20,
+        "total_requests": 100,
+        "max_tokens": 10,
+        "timeout": 5
+      }
+    }
+  ]
+}
