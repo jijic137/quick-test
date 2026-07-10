@@ -55,6 +55,28 @@ TZ_BJ = timezone(timedelta(hours=8))
 
 # ── 线程安全存储 ────────────────────────────────────────────
 _stats_lock = threading.Lock()
+_req_counter = [0]  # 全局请求计数器（用 list 避免 nonlocal）
+
+# ── 工具函数 ────────────────────────────────────────────────
+
+def _gen_request_id() -> str:
+    """生成唯一请求 ID，用于链路追踪。"""
+    _req_counter[0] += 1
+    ts = datetime.now(TZ_BJ).strftime("%Y%m%d%H%M%S%f")
+    return f"req_{ts}_{_req_counter[0]:06d}"
+
+
+def _percentiles(data: list, *ps) -> dict:
+    """计算百分位值。data 为空时返回 {p: 0 for p in ps}。"""
+    if not data:
+        return {f"p{p}": 0 for p in ps}
+    sorted_data = sorted(data)
+    n = len(sorted_data)
+    result = {}
+    for p in ps:
+        idx = int((p / 100.0) * (n - 1))
+        result[f"p{p}"] = round(sorted_data[min(idx, n - 1)], 3)
+    return result
 
 # ---------------------------------------------------------------------------
 # 参数解析
@@ -234,6 +256,7 @@ def api_request(
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
+        "Request-Id": _gen_request_id(),
     }
     payload = {
         "model": model,
@@ -285,6 +308,114 @@ def api_request(
         result["error"] = f"连接失败: {e}"
     except Exception as e:
         result["latency"] = round(time.perf_counter() - t0, 3)
+        result["error"] = f"未知错误: {e}"
+
+    return result
+
+
+def api_request_stream(url: str, key: str, model: str, messages: list,
+                       max_tokens: int = 300, timeout: int = 120) -> dict:
+    """
+    流式请求，返回逐 token 时间戳用于 prefill/decode 分阶段测量。
+    返回:
+      {
+        "ok": bool, "status_code": int|None,
+        "ttft": float,              # Time To First Token (prefill 耗时)
+        "total_latency": float,     # 总耗时
+        "token_times": [float, ...],# 每个 token 到达的相对时间（从请求发出算）
+        "completion_tokens": int,
+        "prompt_tokens": int,
+        "total_tokens": int,
+        "error": str|None,
+      }
+    """
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Request-Id": _gen_request_id(),
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    result = {
+        "ok": False, "status_code": None,
+        "ttft": 0.0, "total_latency": 0.0,
+        "token_times": [],
+        "completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0,
+        "cached_tokens": 0,
+        "error": None,
+    }
+
+    t_start = time.perf_counter()
+    try:
+        resp = requests.post(url, headers=headers, json=payload,
+                             stream=True, timeout=timeout)
+        result["status_code"] = resp.status_code
+
+        if resp.status_code != 200:
+            result["error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            result["total_latency"] = round(time.perf_counter() - t_start, 3)
+            return result
+
+        first_token = None
+        last_token_time = t_start
+        completion_count = 0
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            now = time.perf_counter()
+
+            # 首 token 时间
+            choices = chunk.get("choices", [])
+            if choices and choices[0].get("delta", {}).get("content"):
+                if first_token is None:
+                    first_token = now
+                last_token_time = now
+                completion_count += 1
+                result["token_times"].append(round(now - t_start, 4))
+
+            # usage 通常在最后一块返回
+            if "usage" in chunk and chunk["usage"]:
+                u = chunk["usage"]
+                result["prompt_tokens"] = int(u.get("prompt_tokens", 0))
+                result["completion_tokens"] = int(u.get("completion_tokens", 0))
+                result["total_tokens"] = int(u.get("total_tokens", 0))
+                # 提取缓存命中 token 数
+                ptd = u.get("prompt_tokens_details") or u.get("prompt_tokens_detail") or {}
+                result["cached_tokens"] = int(ptd.get("cached_tokens", 0))
+
+        result["total_latency"] = round(time.perf_counter() - t_start, 3)
+        result["ok"] = first_token is not None
+
+        if first_token:
+            result["ttft"] = round(first_token - t_start, 3)
+            # 如果 usage 没返回，用 token_times 数量
+            if result["completion_tokens"] == 0:
+                result["completion_tokens"] = completion_count
+        else:
+            result["error"] = "未收到任何 token"
+
+    except requests.exceptions.Timeout:
+        result["total_latency"] = round(time.perf_counter() - t_start, 3)
+        result["error"] = "请求超时"
+    except requests.exceptions.ConnectionError as e:
+        result["total_latency"] = round(time.perf_counter() - t_start, 3)
+        result["error"] = f"连接失败: {e}"
+    except Exception as e:
+        result["total_latency"] = round(time.perf_counter() - t_start, 3)
         result["error"] = f"未知错误: {e}"
 
     return result
@@ -816,6 +947,309 @@ def test_rate_limit(cfg: dict, case: dict) -> dict:
     }
 
 # ---------------------------------------------------------------------------
+# TC-07: 工具调用验证
+# ---------------------------------------------------------------------------
+
+def test_tool_calling(cfg: dict, case: dict) -> dict:
+    """TC-07: 完整工具调用闭环验证。
+    第 1 步：模型调用工具 → 校验 tool_calls 和 arguments
+    第 2 步：模拟工具返回 → 模型消化结果并给出最终回复
+    """
+    api = cfg["api"]
+    params = case.get("params", {})
+    tools = params.get("tools", [])
+    max_tokens = params.get("max_tokens", 200)
+    timeout = api.get("timeout", 60)
+
+    headers = {
+        "Authorization": f"Bearer {api['key']}",
+        "Content-Type": "application/json",
+        "Request-Id": _gen_request_id(),
+    }
+
+    # ── 第 1 步：发起带 tool 的请求 ──
+    step1_msgs = [dict(m) for m in params.get("messages", [])]
+    t1 = time.perf_counter()
+    try:
+        resp1 = requests.post(api["url"], headers=headers, json={
+            "model": api["model"],
+            "messages": step1_msgs,
+            "tools": tools,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }, timeout=timeout)
+        latency1 = round(time.perf_counter() - t1, 3)
+    except Exception as e:
+        return _tool_result(case["id"], False, {
+            "step": 1, "error": str(e), "verdict": f"第 1 步请求失败: {e}",
+        })
+
+    body1 = {}
+    try: body1 = resp1.json()
+    except: pass
+
+    choices1 = body1.get("choices", [])
+    msg1 = choices1[0].get("message", {}) if choices1 else {}
+    tool_calls = msg1.get("tool_calls", [])
+    has_tool_calls = len(tool_calls) > 0
+
+    if not has_tool_calls:
+        content = msg1.get("content", "")
+        return _tool_result(case["id"], False, {
+            "step": 1, "status_code": resp1.status_code, "latency_step1": latency1,
+            "has_tool_calls": False, "error": f"未返回 tool_calls: {content[:150]}",
+            "verdict": "第 1 步: 模型未触发工具调用",
+            "usage_step1": body1.get("usage"),
+        })
+
+    tc = tool_calls[0]
+    tool_name = tc.get("function", {}).get("name", "unknown")
+    args_str = tc.get("function", {}).get("arguments", "{}")
+    args_valid = False
+    arguments = None
+    try:
+        arguments = json.loads(args_str)
+        args_valid = isinstance(arguments, dict) and len(arguments) > 0
+    except json.JSONDecodeError:
+        return _tool_result(case["id"], False, {
+            "step": 1, "status_code": resp1.status_code, "latency_step1": latency1,
+            "has_tool_calls": True, "tool_name": tool_name, "arguments_raw": args_str[:200],
+            "verdict": f"第 1 步: tool_call 参数非合法 JSON",
+            "usage_step1": body1.get("usage"),
+        })
+
+    if not args_valid:
+        return _tool_result(case["id"], False, {
+            "step": 1, "status_code": resp1.status_code, "latency_step1": latency1,
+            "has_tool_calls": True, "tool_name": tool_name, "arguments": arguments,
+            "verdict": "第 1 步: tool_call 参数为空",
+            "usage_step1": body1.get("usage"),
+        })
+
+    # ── 第 2 步：模拟工具执行结果，发送回模型 ──
+    tool_result = {"temperature": "26°C", "condition": "晴", "humidity": "45%"}
+    step2_msgs = step1_msgs + [
+        {"role": "assistant", "content": None, "tool_calls": tool_calls},
+        {"role": "tool", "tool_call_id": tc.get("id", "call_1"),
+         "content": json.dumps(tool_result, ensure_ascii=False)},
+    ]
+
+    t2 = time.perf_counter()
+    try:
+        resp2 = requests.post(api["url"], headers=headers, json={
+            "model": api["model"],
+            "messages": step2_msgs,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }, timeout=timeout)
+        latency2 = round(time.perf_counter() - t2, 3)
+    except Exception as e:
+        return _tool_result(case["id"], False, {
+            "step": 2, "tool_name": tool_name, "arguments": arguments,
+            "error": str(e), "verdict": f"第 2 步请求失败: {e}",
+        })
+
+    body2 = {}
+    try: body2 = resp2.json()
+    except: pass
+
+    choices2 = body2.get("choices", [])
+    msg2 = choices2[0].get("message", {}) if choices2 else {}
+    content2 = msg2.get("content", "") or ""
+
+    # 检查最终回复是否引用了工具结果
+    used_tool_result = any(kw in content2 for kw in ["26", "晴", "45", "温度", "weather", "天气"])
+
+    passed = resp2.status_code == 200 and len(content2) > 0
+
+    return {
+        "case_id": case["id"],
+        "passed": passed,
+        "detail": {
+            "status_code": resp2.status_code,
+            "latency": round(latency1 + latency2, 3),
+            "has_tool_calls": True,
+            "tool_name": tool_name,
+            "arguments_valid": args_valid,
+            "arguments": arguments,
+            "tool_result": tool_result,
+            "final_response": content2[:200],
+            "used_tool_result": used_tool_result,
+            "verdict": (
+                f"闭环成功: {tool_name}({json.dumps(arguments, ensure_ascii=False)}) "
+                f"→ 模拟结果 → 模型回复: {content2[:100]}"
+                if passed else f"闭环失败: 第 2 步 HTTP {resp2.status_code}"
+            ),
+            "usage_step1": body1.get("usage"),
+            "usage_step2": body2.get("usage"),
+        },
+    }
+
+
+def _tool_result(cid: str, passed: bool, detail: dict) -> dict:
+    return {"case_id": cid, "passed": passed, "detail": detail}
+
+
+# ---------------------------------------------------------------------------
+# TC-08: 流式性能测试 — prefill / decode 分阶段测量
+# ---------------------------------------------------------------------------
+
+def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
+    """流式请求，分别统计 prefill/decode 阶段指标 + 百分位 + ITL 检查 + 缓存追踪。"""
+    api = cfg["api"]
+    params = case.get("params", {})
+    concurrency = params.get("concurrency", 5)
+    total = params.get("total_requests", 10)
+    max_tokens = params.get("max_tokens", 300)
+    messages = params.get("messages", [{"role": "user", "content": "Hello"}])
+
+    # 每请求指标收集（用于百分位计算）
+    per_req_ttft = []        # prefill 延迟
+    per_req_tpot = []         # decode 每 token 延迟 (ms)
+    per_req_decode_tps = []   # decode tok/s
+    per_req_itl_max = []      # 最大包间延迟 (ms)
+    per_req_cached = []       # 缓存命中 token 数
+
+    stats = {
+        "total": total, "concurrency": concurrency,
+        "ok": 0, "fail": 0,
+        "total_ttft": 0.0,
+        "total_decode_time": 0.0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_cached_tokens": 0,
+        "total_itl": 0.0, "itl_count": 0,
+        "itl_over_500ms": 0,            # 超过 500ms 的 ITL 次数
+        "itl_over_500ms_requests": 0,   # 有超 500ms ITL 的请求数
+        "errors": [],
+    }
+
+    t_start = time.perf_counter()
+
+    def _worker(_idx):
+        varied_msgs = [dict(m) for m in messages]
+        varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
+        r = api_request_stream(
+            url=api["url"], key=api["key"], model=api["model"],
+            messages=varied_msgs, max_tokens=max_tokens,
+            timeout=api.get("timeout", 120),
+        )
+        with _stats_lock:
+            if r["ok"]:
+                stats["ok"] += 1
+                ttft = r.get("ttft", 0)
+                total_lat = r.get("total_latency", 0)
+                decode_time = total_lat - ttft if total_lat > ttft else 0
+                completion = r.get("completion_tokens", 0)
+
+                stats["total_ttft"] += ttft
+                stats["total_decode_time"] += decode_time
+                stats["total_prompt_tokens"] += r.get("prompt_tokens", 0)
+                stats["total_completion_tokens"] += completion
+                stats["total_cached_tokens"] += r.get("cached_tokens", 0)
+
+                # 收集百分位数据
+                per_req_ttft.append(ttft)
+                tpot_ms = round(decode_time / completion * 1000, 2) if completion > 0 else 0
+                per_req_tpot.append(tpot_ms)
+                decode_tps = round(completion / decode_time, 1) if decode_time > 0 else 0
+                per_req_decode_tps.append(decode_tps)
+
+                # ITL 统计
+                times = r.get("token_times", [])
+                req_itl_max = 0
+                req_itl_over = 0
+                if len(times) >= 2:
+                    for i in range(1, len(times)):
+                        itl = times[i] - times[i-1]
+                        itl_ms = round(itl * 1000, 1)
+                        stats["total_itl"] += itl
+                        stats["itl_count"] += 1
+                        if itl > 0.5:  # 500ms
+                            stats["itl_over_500ms"] += 1
+                            req_itl_over += 1
+                        req_itl_max = max(req_itl_max, itl)
+                per_req_itl_max.append(round(req_itl_max * 1000, 1))
+                if req_itl_over > 0:
+                    stats["itl_over_500ms_requests"] += 1
+
+                # 缓存
+                per_req_cached.append(r.get("cached_tokens", 0))
+            else:
+                stats["fail"] += 1
+                if r.get("error") and len(stats["errors"]) < 10:
+                    stats["errors"].append(r["error"])
+        return r
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(_worker, i) for i in range(total)]
+        for f in as_completed(futures):
+            f.result()
+
+    elapsed = time.perf_counter() - t_start
+
+    # ── 汇总指标 ──
+    n_ok = stats["ok"] if stats["ok"] > 0 else 1
+    ttft_avg = round(stats["total_ttft"] / n_ok, 3)
+    decode_time_avg = round(stats["total_decode_time"] / n_ok, 3)
+    total_lat_avg = round(ttft_avg + decode_time_avg, 3)
+
+    total_prompt = stats["total_prompt_tokens"]
+    total_completion = stats["total_completion_tokens"]
+
+    prefill_tps = round(total_prompt / stats["total_ttft"], 1) if stats["total_ttft"] > 0 else 0
+    decode_tps = round(total_completion / stats["total_decode_time"], 1) if stats["total_decode_time"] > 0 else 0
+
+    itl_avg = round(stats["total_itl"] / stats["itl_count"] * 1000, 1) if stats["itl_count"] > 0 else 0
+    tpot_avg = round(stats["total_decode_time"] / total_completion * 1000, 1) if total_completion > 0 else 0
+
+    cache_hit_rate = round(stats["total_cached_tokens"] / (stats["total_prompt_tokens"] + 1) * 100, 1)
+
+    # ── 百分位 ──
+    ttft_pct = _percentiles(per_req_ttft, 50, 75, 90, 99)
+    tpot_pct = _percentiles(per_req_tpot, 50, 99)
+    itl_pct = _percentiles(per_req_itl_max, 50, 90, 99)
+    itl_over_req_pct = round(stats["itl_over_500ms_requests"] / n_ok * 100, 1)
+
+    passed = stats["ok"] > 0
+
+    return {
+        "case_id": case["id"],
+        "passed": passed,
+        "detail": {
+            "elapsed": round(elapsed, 2),
+            "ok": stats["ok"],
+            "fail": stats["fail"],
+            # 平均值
+            "ttft_avg": ttft_avg,
+            "total_lat_avg": total_lat_avg,
+            "prefill_tps": prefill_tps,
+            "decode_tps": decode_tps,
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "itl_avg_ms": itl_avg,
+            "tpot_avg_ms": tpot_avg,
+            # 百分位
+            "ttft_p50": ttft_pct["p50"],
+            "ttft_p75": ttft_pct["p75"],
+            "ttft_p90": ttft_pct["p90"],
+            "ttft_p99": ttft_pct["p99"],
+            "tpot_p50": tpot_pct["p50"],
+            "tpot_p99": tpot_pct["p99"],
+            "itl_max_p50_ms": itl_pct["p50"],
+            "itl_max_p90_ms": itl_pct["p90"],
+            "itl_max_p99_ms": itl_pct["p99"],
+            # 缓存 & 包间延迟
+            "cache_hit_rate": f"{cache_hit_rate}%",
+            "total_cached_tokens": stats["total_cached_tokens"],
+            "itl_over_500ms_count": stats["itl_over_500ms"],
+            "itl_over_500ms_requests_pct": f"{itl_over_req_pct}%",
+            "errors": stats["errors"][:5],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # CSV 输出 — 单文件：报告区 + 用例表
 # ---------------------------------------------------------------------------
 
@@ -996,6 +1430,28 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 )
                 if detail.get("note"):
                     actual += f", {detail['note']}"
+            elif cid == "TC-07":
+                actual = (
+                    f"闭环{'通过' if passed else '失败'}, "
+                    f"tool={detail.get('tool_name') or 'N/A'}, "
+                    f"args={json.dumps(detail.get('arguments', {}), ensure_ascii=False)[:60]}, "
+                    f"结果已利用={'是' if detail.get('used_tool_result') else '否'}, "
+                    f"HTTP {detail.get('status_code')}, "
+                    f"延迟 {detail.get('latency', 'N/A')}s"
+                )
+                if detail.get("verdict"):
+                    actual += f" | {detail['verdict'][:150]}"
+            elif cid == "TC-08":
+                actual = (
+                    f"成功 {detail.get('ok')}/{detail.get('ok',0)+detail.get('fail',0)}, "
+                    f"TTFT avg={detail.get('ttft_avg')}s P50={detail.get('ttft_p50')}s P99={detail.get('ttft_p99')}s, "
+                    f"Prefill={detail.get('prefill_tps')} tok/s, "
+                    f"Decode={detail.get('decode_tps')} tok/s, "
+                    f"TPOT avg={detail.get('tpot_avg_ms')}ms P50={detail.get('tpot_p50')}ms P99={detail.get('tpot_p99')}ms, "
+                    f"ITL avg={detail.get('itl_avg_ms')}ms, "
+                    f"ITL>500ms={detail.get('itl_over_500ms_count')}次({detail.get('itl_over_500ms_requests_pct')}请求), "
+                    f"Cache命中={detail.get('cache_hit_rate')}"
+                )
             else:
                 actual = json.dumps(detail, ensure_ascii=False)
 
@@ -1017,9 +1473,11 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
 SUMMARY_COLUMNS = [
     "模型名", "测试时间", "并发数", "总请求数",
     "TPS (tok/s)", "TPM (tok/min)", "请求成功率",
-    "Token 总数", "平均延迟 (s)",
+    "Token 总数", "平均延迟 (s)", "Prefill (tok/s)", "Decode (tok/s)",
+    "TTFT (s)", "ITL (ms)", "TPOT (ms/tok)",
     "TC-01 连通性", "TC-02 TPS压测", "TC-03 TPM换算",
     "TC-04 上下文", "TC-05 鉴权", "TC-06 限流",
+    "TC-07 工具调用", "TC-08 流式性能",
     "总通过", "总失败", "测试结论",
 ]
 
@@ -1083,6 +1541,21 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
             reason = str(reason)[:80].replace("\n", " ").replace(",", "，")
             case_status[cid] = f"失败: {reason}"
 
+    # ── 提取流式性能指标 ──
+    prefill_tps_s = "N/A"
+    decode_tps_s = "N/A"
+    ttft_s = "N/A"
+    itl_s = "N/A"
+    tpot_s = "N/A"
+    for r in results:
+        if r.get("case_id") == "TC-08" and r.get("detail"):
+            d = r["detail"]
+            prefill_tps_s = str(d.get("prefill_tps", "N/A"))
+            decode_tps_s = str(d.get("decode_tps", "N/A"))
+            ttft_s = f"{d.get('ttft_avg', 'N/A')} (p50:{d.get('ttft_p50','')} p99:{d.get('ttft_p99','')})"
+            itl_s = f"{d.get('itl_avg_ms', 'N/A')} (max p99:{d.get('itl_max_p99_ms','')})"
+            tpot_s = f"{d.get('tpot_avg_ms', 'N/A')} (p50:{d.get('tpot_p50','')} p99:{d.get('tpot_p99','')})"
+
     # ── 构建行数据 ──
     row = [
         cfg["api"].get("model", ""),
@@ -1094,12 +1567,19 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
         success_rate,
         str(total_tokens),
         str(avg_latency),
+        prefill_tps_s,
+        decode_tps_s,
+        ttft_s,
+        itl_s,
+        tpot_s,
         case_status.get("TC-01", ""),
         case_status.get("TC-02", ""),
         case_status.get("TC-03", ""),
         case_status.get("TC-04", ""),
         case_status.get("TC-05", ""),
         case_status.get("TC-06", ""),
+        case_status.get("TC-07", ""),
+        case_status.get("TC-08", ""),
         str(passed_cases),
         str(failed_cases),
         conclusion,
@@ -1167,6 +1647,8 @@ def main():
         "context_limit": test_context_limit,
         "auth_failure": test_auth_failure,
         "rate_limit": test_rate_limit,
+        "tool_calling": test_tool_calling,
+        "streaming_benchmark": test_streaming_benchmark,
     }
 
     results = []

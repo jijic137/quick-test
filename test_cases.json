@@ -81,6 +81,61 @@
         "max_tokens": 10,
         "timeout": 5
       }
+    },
+    {
+      "id": "TC-07",
+      "name": "工具调用验证",
+      "type": "功能",
+      "input": "两阶段闭环：模型调用工具 → 模拟返回结果 → 模型消化结果给出最终回复",
+      "expected": "第 1 步返回 tool_calls + 合法 arguments，第 2 步模型利用工具结果生成回复",
+      "method": "tool_calling",
+      "params": {
+        "max_tokens": 200,
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_current_weather",
+              "description": "获取指定城市的当前天气",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "城市名称，如 Beijing, Tokyo"
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": ["celsius", "fahrenheit"],
+                    "description": "温度单位"
+                  }
+                },
+                "required": ["location"]
+              }
+            }
+          }
+        ],
+        "messages": [
+          {"role": "user", "content": "北京今天的天气怎么样？"}
+        ]
+      }
+    },
+    {
+      "id": "TC-08",
+      "name": "流式性能测试",
+      "type": "性能",
+      "input": "流式请求，测量 Prefill/Decode 两阶段指标 + 百分位 + 缓存命中 + 包间延迟",
+      "expected": "TTFT p50/p90/p99 < 30s, TPOT p50 > 50 tok/s, ITL max < 500ms",
+      "method": "streaming_benchmark",
+      "params": {
+        "concurrency": 5,
+        "total_requests": 10,
+        "max_tokens": 300,
+        "messages": [
+          {"role": "system", "content": "You are a helpful assistant. Provide clear, concise answers."},
+          {"role": "user", "content": "Explain what a Transformer model is and how the self-attention mechanism works. Include key concepts like Q, K, V matrices, multi-head attention, and positional encoding. Write about 250-300 words."}
+        ]
+      }
     }
   ]
 }
