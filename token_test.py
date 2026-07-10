@@ -1740,13 +1740,16 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
 # ---------------------------------------------------------------------------
 
 SUMMARY_COLUMNS = [
-    "模型名", "测试时间", "并发数", "总请求数",
+    "模型名", "测试时间", "并发数", "总请求数", "输入Tokens",
     "TPS (tok/s)", "TPM (tok/min)", "请求成功率",
     "Token 总数", "平均延迟 (s)", "Prefill (tok/s)", "Decode (tok/s)",
-    "TTFT (s)", "ITL (ms)", "TPOT (ms/tok)",
-    "TC-01 连通性", "TC-02 TPS压测", "TC-03 TPM换算",
-    "TC-04 上下文", "TC-05 鉴权", "TC-06 限流",
-    "TC-07 工具调用", "TC-08 流式性能", "TC-09 缓存命中",
+    "TTFT-avg(s)", "TTFT-p50(s)", "TTFT-p90(s)", "TTFT-p99(s)",
+    "TPOT-avg(ms)", "TPOT-p50(ms)", "TPOT-p99(ms)",
+    "ITL-avg(ms)", "ITL-max-p99(ms)", "ITL>500ms请求占比",
+    "缓存命中率", "缓存Token数",
+    "TC-01连通性", "TC-02 TPS压测", "TC-03 TPM换算",
+    "TC-04上下文", "TC-05鉴权", "TC-06限流",
+    "TC-07工具调用", "TC-08流式性能", "TC-09缓存命中",
     "总通过", "总失败", "测试结论",
 ]
 
@@ -1816,14 +1819,31 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
     ttft_s = "N/A"
     itl_s = "N/A"
     tpot_s = "N/A"
+    ttft_avg_s = itl_avg_s = tpot_avg_s = "N/A"
+    ttft_p50_s = ttft_p90_s = ttft_p99_s = "N/A"
+    tpot_p50_s = tpot_p99_s = "N/A"
+    itl_max_p99_s = "N/A"
+    itl_over_req_s = "N/A"
+    cache_rate_s = "N/A"
+    cache_tokens_s = "N/A"
+
     for r in results:
         if r.get("case_id") == "TC-08" and r.get("detail"):
             d = r["detail"]
             prefill_tps_s = str(d.get("prefill_tps", "N/A"))
             decode_tps_s = str(d.get("decode_tps", "N/A"))
-            ttft_s = f"{d.get('ttft_avg', 'N/A')} (p50:{d.get('ttft_p50','')} p99:{d.get('ttft_p99','')})"
-            itl_s = f"{d.get('itl_avg_ms', 'N/A')} (max p99:{d.get('itl_max_p99_ms','')})"
-            tpot_s = f"{d.get('tpot_avg_ms', 'N/A')} (p50:{d.get('tpot_p50','')} p99:{d.get('tpot_p99','')})"
+            ttft_avg_s = str(d.get("ttft_avg", "N/A"))
+            ttft_p50_s = str(d.get("ttft_p50", "N/A"))
+            ttft_p90_s = str(d.get("ttft_p90", "N/A"))
+            ttft_p99_s = str(d.get("ttft_p99", "N/A"))
+            tpot_avg_s = str(d.get("tpot_avg_ms", "N/A"))
+            tpot_p50_s = str(d.get("tpot_p50", "N/A"))
+            tpot_p99_s = str(d.get("tpot_p99", "N/A"))
+            itl_avg_s = str(d.get("itl_avg_ms", "N/A"))
+            itl_max_p99_s = str(d.get("itl_max_p99_ms", "N/A"))
+            itl_over_req_s = str(d.get("itl_over_500ms_requests_pct", "N/A"))
+            cache_rate_s = str(d.get("cache_hit_rate", "N/A"))
+            cache_tokens_s = str(d.get("total_cached_tokens", "N/A"))
 
     # ── 构建行数据 ──
     row = [
@@ -1831,6 +1851,7 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
         test_time,
         str(cfg.get("benchmark", {}).get("concurrency", "")),
         str(cfg.get("benchmark", {}).get("total_requests", "")),
+        str(cfg.get("benchmark", {}).get("input_tokens", "")),
         tps_val,
         tpm_val,
         success_rate,
@@ -1838,9 +1859,18 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
         str(avg_latency),
         prefill_tps_s,
         decode_tps_s,
-        ttft_s,
-        itl_s,
-        tpot_s,
+        ttft_avg_s,
+        ttft_p50_s,
+        ttft_p90_s,
+        ttft_p99_s,
+        tpot_avg_s,
+        tpot_p50_s,
+        tpot_p99_s,
+        itl_avg_s,
+        itl_max_p99_s,
+        itl_over_req_s,
+        cache_rate_s,
+        cache_tokens_s,
         case_status.get("TC-01", ""),
         case_status.get("TC-02", ""),
         case_status.get("TC-03", ""),
