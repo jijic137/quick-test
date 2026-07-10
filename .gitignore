@@ -7,3 +7,6 @@ test_config.json
 # Python
 __pycache__/
 *.pyc
+
+#其他
+template.xlsx

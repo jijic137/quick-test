@@ -1742,11 +1742,9 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
 SUMMARY_COLUMNS = [
     "模型名", "测试时间", "并发数", "总请求数", "输入Tokens",
     "TPS (tok/s)", "TPM (tok/min)", "请求成功率",
-    "Token 总数", "平均延迟 (s)", "Prefill (tok/s)", "Decode (tok/s)",
-    "TTFT-avg(s)", "TTFT-p50(s)", "TTFT-p90(s)", "TTFT-p99(s)",
-    "TPOT-avg(ms)", "TPOT-p50(ms)", "TPOT-p99(ms)",
-    "ITL-avg(ms)", "ITL-max-p99(ms)", "ITL>500ms请求占比",
-    "缓存命中率", "缓存Token数",
+    "Token 总数", "平均延迟 (s)",
+    "TTFT-avg(s)", "TTFT-p99(s)", "TPOT-avg(ms)", "Decode (tok/s)",
+    "缓存命中率",
     "TC-01连通性", "TC-02 TPS压测", "TC-03 TPM换算",
     "TC-04上下文", "TC-05鉴权", "TC-06限流",
     "TC-07工具调用", "TC-08流式性能", "TC-09缓存命中",
@@ -1754,19 +1752,14 @@ SUMMARY_COLUMNS = [
 ]
 
 
-def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: str) -> None:
-    """
-    在累积汇总 CSV 中追加一行。
-    如果文件不存在则先写入表头。
-    """
-    # ── 汇总数据 ──
+def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
+    """从测试结果构建一行汇总数据（与 SUMMARY_COLUMNS 对齐）。"""
     total_cases = len(results)
     passed_cases = sum(1 for r in results if r.get("passed"))
     failed_cases = total_cases - passed_cases
     total_tokens = 0
     total_latency = 0.0
     latency_count = 0
-    context_passed = "否"
 
     for r in results:
         d = r.get("detail", {})
@@ -1779,8 +1772,6 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
                     latency_count += 1
                 except (ValueError, TypeError):
                     pass
-            if r.get("case_id") == "TC-04":
-                context_passed = "是" if r.get("passed") else "否"
 
     avg_latency = round(total_latency / latency_count, 3) if latency_count else 0
     success_rate = f"{passed_cases / total_cases * 100:.1f}%" if total_cases else "N/A"
@@ -1802,51 +1793,39 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
             case_status[cid] = "通过"
         else:
             detail = r.get("detail", {})
-            # 取最精炼的失败原因
             reason = (
                 detail.get("failure_reason") or
                 detail.get("reason") or
                 detail.get("error") or
                 "失败"
             )
-            # 截断到 80 字符，适合 CSV 单元格
             reason = str(reason)[:80].replace("\n", " ").replace(",", "，")
             case_status[cid] = f"失败: {reason}"
 
-    # ── 提取流式性能指标 ──
-    prefill_tps_s = "N/A"
+    # ── 提取流式性能指标（精简版：TTFT-avg, TTFT-p99, TPOT-avg, Decode）──
+    ttft_avg_s = "N/A"
+    ttft_p99_s = "N/A"
+    tpot_avg_s = "N/A"
     decode_tps_s = "N/A"
-    ttft_s = "N/A"
-    itl_s = "N/A"
-    tpot_s = "N/A"
-    ttft_avg_s = itl_avg_s = tpot_avg_s = "N/A"
-    ttft_p50_s = ttft_p90_s = ttft_p99_s = "N/A"
-    tpot_p50_s = tpot_p99_s = "N/A"
-    itl_max_p99_s = "N/A"
-    itl_over_req_s = "N/A"
     cache_rate_s = "N/A"
-    cache_tokens_s = "N/A"
 
     for r in results:
         if r.get("case_id") == "TC-08" and r.get("detail"):
             d = r["detail"]
-            prefill_tps_s = str(d.get("prefill_tps", "N/A"))
-            decode_tps_s = str(d.get("decode_tps", "N/A"))
             ttft_avg_s = str(d.get("ttft_avg", "N/A"))
-            ttft_p50_s = str(d.get("ttft_p50", "N/A"))
-            ttft_p90_s = str(d.get("ttft_p90", "N/A"))
             ttft_p99_s = str(d.get("ttft_p99", "N/A"))
             tpot_avg_s = str(d.get("tpot_avg_ms", "N/A"))
-            tpot_p50_s = str(d.get("tpot_p50", "N/A"))
-            tpot_p99_s = str(d.get("tpot_p99", "N/A"))
-            itl_avg_s = str(d.get("itl_avg_ms", "N/A"))
-            itl_max_p99_s = str(d.get("itl_max_p99_ms", "N/A"))
-            itl_over_req_s = str(d.get("itl_over_500ms_requests_pct", "N/A"))
+            decode_tps_s = str(d.get("decode_tps", "N/A"))
             cache_rate_s = str(d.get("cache_hit_rate", "N/A"))
-            cache_tokens_s = str(d.get("total_cached_tokens", "N/A"))
 
-    # ── 构建行数据 ──
-    row = [
+    # ── 如果 TC-09 有缓存命中率，优先用 TC-09 的 ──
+    for r in results:
+        if r.get("case_id") == "TC-09" and r.get("detail"):
+            d = r["detail"]
+            if d.get("cache_hit"):
+                cache_rate_s = d.get("ttft_reduction_pct", cache_rate_s)
+
+    return [
         cfg["api"].get("model", ""),
         test_time,
         str(cfg.get("benchmark", {}).get("concurrency", "")),
@@ -1857,20 +1836,11 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
         success_rate,
         str(total_tokens),
         str(avg_latency),
-        prefill_tps_s,
-        decode_tps_s,
         ttft_avg_s,
-        ttft_p50_s,
-        ttft_p90_s,
         ttft_p99_s,
         tpot_avg_s,
-        tpot_p50_s,
-        tpot_p99_s,
-        itl_avg_s,
-        itl_max_p99_s,
-        itl_over_req_s,
+        decode_tps_s,
         cache_rate_s,
-        cache_tokens_s,
         case_status.get("TC-01", ""),
         case_status.get("TC-02", ""),
         case_status.get("TC-03", ""),
@@ -1885,15 +1855,78 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
         conclusion,
     ]
 
-    # ── 写入（带表头判断）──
-    file_exists = output_path.exists()
-    with open(output_path, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(SUMMARY_COLUMNS)
-        writer.writerow(row)
 
-    print(f"[OK] 累积汇总已更新: {output_path} (+1 行)")
+def _read_csv_rows(path: Path) -> tuple:
+    """读取 CSV 文件，返回 (headers: list, rows: list[list[str]])。
+    文件不存在或为空时返回 (None, [])。"""
+    if not path.exists():
+        return None, []
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            all_rows = list(reader)
+    except Exception:
+        return None, []
+    if not all_rows:
+        return None, []
+    return all_rows[0], all_rows[1:]
+
+
+def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: str) -> None:
+    """
+    在累积汇总 CSV 中追加一行。
+    - 文件不存在 → 创建并写入表头 + 数据
+    - 文件存在且表头一致 → 追加一行
+    - 文件存在但表头不一致 → 读取旧数据，用新表头重建整个文件
+    """
+    new_row = _build_summary_row(results, cfg, test_time)
+    existing_headers, existing_rows = _read_csv_rows(output_path)
+
+    # ── 情况 1: 文件不存在，直接创建 ──
+    if existing_headers is None:
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(SUMMARY_COLUMNS)
+            writer.writerow(new_row)
+        print(f"[OK] 累积汇总已创建: {output_path} (+1 行)")
+        return
+
+    # ── 情况 2: 表头一致，直接追加 ──
+    if existing_headers == SUMMARY_COLUMNS:
+        with open(output_path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(new_row)
+        print(f"[OK] 累积汇总已更新: {output_path} (+1 行)")
+        return
+
+    # ── 情况 3: 表头不一致（升级了列定义），重建文件 ──
+    print(f"[INFO] 检测到表头变化，正在迁移旧数据...")
+    print(f"       旧列数: {len(existing_headers)} → 新列数: {len(SUMMARY_COLUMNS)}")
+
+    # 将旧行映射为新列（同名列保留值，新列留空，旧列丢弃）
+    migrated_rows = []
+    for old_row in existing_rows:
+        if not old_row:
+            continue
+        new_row_mapped = []
+        for col_name in SUMMARY_COLUMNS:
+            try:
+                idx = existing_headers.index(col_name)
+                new_row_mapped.append(old_row[idx] if idx < len(old_row) else "")
+            except ValueError:
+                new_row_mapped.append("")  # 新列，旧数据没有
+        migrated_rows.append(new_row_mapped)
+
+    # 追加当前新行
+    migrated_rows.append(new_row)
+
+    # 重写整个文件
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(SUMMARY_COLUMNS)
+        writer.writerows(migrated_rows)
+
+    print(f"[OK] 累积汇总已重建: {output_path} ({len(migrated_rows)} 行数据，含本次)")
 
 # ---------------------------------------------------------------------------
 # 主流程
