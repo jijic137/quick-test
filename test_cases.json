@@ -14,7 +14,7 @@
       "params": {
         "max_tokens": 50,
         "messages": [
-          {"role": "user", "content": "Hello, reply with just 'OK'."}
+          {"role": "user", "content": "What is the capital of France? Reply in one word."}
         ]
       }
     },
@@ -22,15 +22,16 @@
       "id": "TC-02",
       "name": "TPS 压测",
       "type": "性能",
-      "input": "并发={{concurrency}} 总请求={{total_requests}}",
+      "input": "并发={{concurrency}} 总请求={{total_requests}}，模拟真实对话场景（输入 ~450 tokens，输出 ~300 tokens）",
       "expected": "TPS/TPM 数值有效，成功率>0",
       "method": "tps_benchmark",
       "params": {
         "concurrency": 4,
         "total_requests": 20,
-        "max_tokens": 100,
+        "max_tokens": 300,
         "messages": [
-          {"role": "user", "content": "Say hello in one word."}
+          {"role": "system", "content": "You are a senior backend engineer and technical writer. You provide clear, well-structured explanations with practical code examples where relevant. Use markdown formatting for readability. Keep your answers focused and avoid unnecessary fluff. Always think about production scenarios: high traffic, fault tolerance, observability, and cost optimization."},
+          {"role": "user", "content": "I'm designing a public API gateway for a SaaS platform that handles ~10,000 requests per second. I need a comprehensive explanation of API rate limiting. Please cover the following in detail:\n\n1. **Why rate limiting matters** — from both the provider and consumer perspective. Include 2-3 real-world failure scenarios that happened at major companies without proper rate limiting.\n\n2. **Algorithm comparison** — Explain these five algorithms with their pros, cons, and best use cases:\n   - Token Bucket\n   - Leaky Bucket\n   - Fixed Window Counter\n   - Sliding Window Log\n   - Sliding Window Counter\n\n3. **HTTP semantics** — What status code (with exact number) should be returned? What response headers (at least 4) should be included and what does each one tell the client?\n\n4. **Client-side best practices** — describe 5 practical strategies clients should implement to handle rate limits gracefully, with a short Python code snippet for the most important one.\n\nWrite approximately 300-400 words total in a structured format with clear section headings."}
         ]
       }
     },

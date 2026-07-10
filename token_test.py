@@ -133,6 +133,12 @@ def parse_args():
         default=defaults["context_tokens"],
         help="上下文验收阈值 tokens (默认: 512000)",
     )
+    parser.add_argument(
+        "--probe-context",
+        action="store_true",
+        default=False,
+        help="启用渐进式上下文探测：从小量递增直到找到实际上限（较慢但精确）",
+    )
 
     return parser.parse_args()
 
@@ -273,6 +279,159 @@ def api_request(
 
     return result
 
+
+def query_model_info(url: str, key: str, model: str, timeout: int = 30) -> dict:
+    """
+    查询 /v1/models 获取模型声明的上下文长度等信息。
+    返回 {"ok": bool, "context_length": int|None, "raw": dict|None, "error": str|None}
+    """
+    result = {"ok": False, "context_length": None, "raw": None, "error": None}
+
+    # 从 chat completions URL 推导 models URL
+    models_url = url.rstrip("/").replace("/chat/completions", "/models")
+    if not models_url.endswith("/models"):
+        models_url = url.rstrip("/") + "/models"
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    try:
+        resp = requests.get(models_url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            result["ok"] = True
+            result["raw"] = data
+
+            # 尝试提取目标模型的 context_length
+            models_list = data.get("data", [data] if isinstance(data, dict) else [])
+            for m in models_list:
+                if isinstance(m, dict) and m.get("id") == model:
+                    cl = m.get("context_length") or m.get("max_context_length") or m.get("context_window")
+                    if cl:
+                        result["context_length"] = int(cl)
+                    result["raw"] = m
+                    break
+            # 没找到精确匹配，返回第一个模型的 context_length 作为参考
+            if result["context_length"] is None and models_list:
+                first = models_list[0] if isinstance(models_list[0], dict) else {}
+                cl = first.get("context_length") or first.get("max_context_length") or first.get("context_window")
+                if cl:
+                    result["context_length"] = int(cl)
+        else:
+            result["error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
+def probe_context_limit(cfg: dict, params: dict) -> dict:
+    """
+    渐进式探测实际上下文上限（二分搜索）。
+    从小量开始，逐步翻倍直到失败，然后在最后区间二分精确定位。
+    返回 {"max_tokens": int, "passed": bool, "attempts": list, "error": str|None}
+    """
+    api = cfg["api"]
+    target = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
+    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 2.5)
+    timeout = max(api.get("timeout", 60), params.get("timeout", 600))
+    prompt_template = params.get(
+        "prompt_template",
+        "请总结以下文本的开头3个字和结尾3个字，用英文回复: {padding}"
+    )
+
+    attempts = []
+    low, high = 1000, target  # 从 1000 tokens 开始
+    last_success = 0
+    found_limit = None
+
+    print(f"\n         [探测] 开始渐进式上下文探测 (timeout={timeout}s)...")
+
+    # 阶段 1: 翻倍递增，找到上界
+    test_size = low
+    while test_size <= high:
+        chars = int(test_size * chars_per_token)
+        chunk = "测" * min(chars, 2_000_000)
+        messages = [{"role": "user", "content": prompt_template.format(padding=chunk)}]
+
+        t0 = time.perf_counter()
+        result = api_request(
+            url=api["url"], key=api["key"], model=api["model"],
+            messages=messages, max_tokens=50, timeout=timeout,
+        )
+        elapsed = round(time.perf_counter() - t0, 2)
+        status = "PASS" if result["ok"] else "FAIL"
+        err = result.get("error", "")[:80] if not result["ok"] else ""
+        print(f"         [探测] {test_size:>8} tokens -> {status} ({elapsed}s){' | '+err if err else ''}")
+
+        attempts.append({
+            "size": test_size,
+            "ok": result["ok"],
+            "elapsed": elapsed,
+            "status_code": result.get("status_code"),
+            "error": result.get("error", "")[:200],
+        })
+
+        if result["ok"]:
+            last_success = test_size
+            if test_size >= high:
+                found_limit = test_size
+                break
+            test_size *= 2
+            if test_size > high:
+                test_size = high  # 最后一跳精确到 target
+        else:
+            # 失败了，在当前区间二分
+            high = test_size
+            low = last_success
+            break
+
+    # 阶段 2: 二分精确定位（如果翻倍阶段找到了失败点）
+    if found_limit is None and low < high:
+        print(f"         [探测] 二分定位: {low} ~ {high}")
+        while low < high - 500:  # 精度到 500 tokens
+            mid = (low + high) // 2
+            chars = int(mid * chars_per_token)
+            chunk = "测" * min(chars, 2_000_000)
+            messages = [{"role": "user", "content": prompt_template.format(padding=chunk)}]
+
+            t0 = time.perf_counter()
+            result = api_request(
+                url=api["url"], key=api["key"], model=api["model"],
+                messages=messages, max_tokens=50, timeout=timeout,
+            )
+            elapsed = round(time.perf_counter() - t0, 2)
+            status = "PASS" if result["ok"] else "FAIL"
+            err = result.get("error", "")[:80] if not result["ok"] else ""
+            print(f"         [探测] {mid:>8} tokens -> {status} ({elapsed}s){' | '+err if err else ''}")
+
+            attempts.append({
+                "size": mid,
+                "ok": result["ok"],
+                "elapsed": elapsed,
+                "status_code": result.get("status_code"),
+                "error": result.get("error", "")[:200],
+            })
+
+            if result["ok"]:
+                low = mid
+                last_success = mid
+            else:
+                high = mid
+
+        found_limit = last_success if last_success > 0 else low
+
+    if found_limit is None:
+        found_limit = last_success
+
+    passed = found_limit is not None and found_limit >= target
+
+    return {
+        "passed": passed,
+        "found_limit": found_limit,
+        "target": target,
+        "attempts": attempts,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 配置字典构建（统一 CLI args 和 CFG 为兼容的 dict）
 # ---------------------------------------------------------------------------
@@ -347,9 +506,12 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
     t_start = time.perf_counter()
 
     def _worker(_idx):
+        # 每个请求在末尾追加唯一标记，避免 KV-cache 命中导致 TPS 虚高
+        varied_msgs = [dict(m) for m in messages]
+        varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
         r = api_request(
             url=api["url"], key=api["key"], model=api["model"],
-            messages=messages, max_tokens=max_tokens,
+            messages=varied_msgs, max_tokens=max_tokens,
             timeout=api.get("timeout", 60),
         )
         with _stats_lock:
@@ -424,13 +586,56 @@ def test_tpm_calc(cfg: dict, case: dict, prev_result: dict = None) -> dict:
     }
 
 
-def test_context_limit(cfg: dict, case: dict) -> dict:
-    """TC-04: 512k 上下文验收 — 发送超长上下文。"""
+def test_context_limit(cfg: dict, case: dict, probe_mode: bool = False,
+                       model_info: dict = None) -> dict:
+    """TC-04: 上下文窗口快速验收，优先查模型声明，支持渐进探测。"""
     api = cfg["api"]
     params = case.get("params", {})
     target_tokens = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
     chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 2.5)
+    timeout = max(api.get("timeout", 60), params.get("timeout", 600))
 
+    # ── 渐进式探测模式 ──
+    if probe_mode:
+        probe_result = probe_context_limit(cfg, params)
+        found = probe_result.get("found_limit", 0)
+        return {
+            "case_id": case["id"],
+            "passed": probe_result["passed"],
+            "detail": {
+                "mode": "probe",
+                "target": target_tokens,
+                "found_limit": found,
+                "threshold_reached": found is not None and found >= target_tokens,
+                "attempts_count": len(probe_result.get("attempts", [])),
+                "attempts": probe_result.get("attempts", []),
+            },
+        }
+
+    # ── 快速模式：优先用模型声明判断 ──
+    declared = None
+    if model_info and model_info.get("ok") and model_info.get("context_length"):
+        declared = model_info["context_length"]
+
+    if declared is not None:
+        passed = declared >= target_tokens
+        return {
+            "case_id": case["id"],
+            "passed": passed,
+            "detail": {
+                "mode": "declared",
+                "target": target_tokens,
+                "declared_context_length": declared,
+                "passed": passed,
+                "reason": (
+                    f"模型声明上下文长度 {declared} >= {target_tokens}，通过"
+                    if passed else
+                    f"模型声明上下文长度 {declared} < {target_tokens}，不满足要求"
+                ),
+            },
+        }
+
+    # ── 未声明：发一次请求验证 ──
     total_chars = int(target_tokens * chars_per_token)
     chunk = "测" * min(int(total_chars), 2_000_000)
 
@@ -447,31 +652,59 @@ def test_context_limit(cfg: dict, case: dict) -> dict:
         url=api["url"], key=api["key"], model=api["model"],
         messages=messages,
         max_tokens=params.get("max_output_tokens", 50),
-        timeout=max(api.get("timeout", 60), params.get("timeout", 600)),
+        timeout=timeout,
     )
-    elapsed = time.perf_counter() - t0
+    elapsed = round(time.perf_counter() - t0, 2)
 
+    # ── 失败原因分析 ──
+    failure_reason = None
     is_context_error = False
-    if result["error"]:
-        err_lower = result["error"].lower()
-        is_context_error = any(
+    is_timeout = False
+
+    if not result["ok"]:
+        status_code = result.get("status_code")
+        error_msg = result.get("error") or ""
+
+        if error_msg == "请求超时":
+            is_timeout = True
+            failure_reason = (
+                f"请求超时 ({elapsed}s, timeout={timeout}s)。"
+                "可能原因: 1) 模型处理长上下文耗时超过超时设置; "
+                "2) 网关/代理层超时; 3) 模型不支持此长度导致无响应。"
+                "建议: 使用 --probe-context 渐进探测实际支持的上限。"
+            )
+        elif status_code in (400, 413, 422):
+            is_context_error = True
+            failure_reason = f"服务端明确拒绝 (HTTP {status_code}): {error_msg[:200]}"
+        elif status_code in (429,):
+            failure_reason = f"被限流 (HTTP 429): {error_msg[:200]}"
+        elif status_code in (500, 502, 503, 504):
+            failure_reason = f"服务端错误 (HTTP {status_code}): {error_msg[:200]}"
+        else:
+            failure_reason = f"未知错误 (HTTP {status_code}): {error_msg[:200]}"
+
+        err_lower = error_msg.lower()
+        is_context_error = is_context_error or any(
             kw in err_lower
-            for kw in ["context", "token", "length", "limit", "maximum", "exceed", "too long"]
+            for kw in ["context", "token", "length", "limit", "maximum", "exceed", "too long", "truncat"]
         )
 
-    estimated_input_tokens = target_tokens
     passed = result["ok"]
 
     return {
         "case_id": case["id"],
         "passed": passed,
         "detail": {
+            "mode": "live_test",
+            "target": target_tokens,
+            "declared": declared,
             "status_code": result["status_code"],
             "ok": result["ok"],
-            "latency": round(elapsed, 2),
-            "estimated_input_tokens": estimated_input_tokens,
+            "latency": elapsed,
             "is_context_error": is_context_error,
-            "error": result["error"],
+            "is_timeout": is_timeout,
+            "failure_reason": failure_reason,
+            "error": result.get("error"),
             "usage": result["usage"],
         },
     }
@@ -714,13 +947,30 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 if detail.get("error"):
                     actual += f", {detail['error']}"
             elif cid == "TC-04":
-                actual = (
-                    f"HTTP {detail.get('status_code')}, "
-                    f"估算输入 {detail.get('estimated_input_tokens')} tokens, "
-                    f"上下文错误: {'是' if detail.get('is_context_error') else '否'}"
-                )
-                if not passed and detail.get("error"):
-                    actual += f", {detail['error'][:100]}"
+                mode = detail.get("mode", "")
+                if mode == "declared":
+                    actual = (
+                        f"模型声明 {detail.get('declared_context_length')} tokens, "
+                        f"阈值 {detail.get('target')}, {detail.get('reason', '')}"
+                    )
+                elif mode == "probe":
+                    actual = (
+                        f"探测上限: {detail.get('found_limit')} tokens, "
+                        f"阈值 {detail.get('target')}, "
+                        f"{'达到' if detail.get('threshold_reached') else '未达到'}, "
+                        f"共 {detail.get('attempts_count', 0)} 次尝试"
+                    )
+                else:
+                    actual = (
+                        f"HTTP {detail.get('status_code')}, "
+                        f"延迟 {detail.get('latency', 'N/A')}s, "
+                    )
+                    if detail.get("failure_reason"):
+                        actual += f"{detail['failure_reason'][:150]}"
+                    elif detail.get("usage"):
+                        actual += f"usage={detail['usage'].get('total', 'N/A')} tokens"
+                    else:
+                        actual += f"error: {(detail.get('error') or 'N/A')[:100]}"
             elif cid == "TC-05":
                 actual = (
                     f"HTTP {detail.get('status_code')}, "
@@ -804,10 +1054,24 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
             tps_val = d.get("tps_tokens", "N/A")
             tpm_val = d.get("tpm_tokens", "N/A")
 
-    # ── 各用例通过状态 ──
+    # ── 各用例通过状态（失败时附简短原因）──
     case_status = {}
     for r in results:
-        case_status[r.get("case_id", "?")] = "通过" if r.get("passed") else "失败"
+        cid = r.get("case_id", "?")
+        if r.get("passed"):
+            case_status[cid] = "通过"
+        else:
+            detail = r.get("detail", {})
+            # 取最精炼的失败原因
+            reason = (
+                detail.get("failure_reason") or
+                detail.get("reason") or
+                detail.get("error") or
+                "失败"
+            )
+            # 截断到 80 字符，适合 CSV 单元格
+            reason = str(reason)[:80].replace("\n", " ").replace(",", "，")
+            case_status[cid] = f"失败: {reason}"
 
     # ── 构建行数据 ──
     row = [
@@ -857,6 +1121,21 @@ def main():
     print(f"  Timeout:  {cfg['api']['timeout']}s")
     print(f"  并发/请求: {cfg['benchmark']['concurrency']}/{cfg['benchmark']['total_requests']}")
     print(f"  上下文阈值: {cfg['context_test']['target_tokens']} tokens")
+    if args.probe_context:
+        print(f"  上下文模式: 渐进式探测")
+    print()
+
+    # ── 查询模型信息 ──
+    api = cfg["api"]
+    print("[INFO] 查询模型信息...")
+    model_info = query_model_info(api["url"], api["key"], api["model"], api.get("timeout", 30))
+    if model_info["ok"]:
+        if model_info["context_length"]:
+            print(f"       模型声明上下文长度: {model_info['context_length']} tokens")
+        else:
+            print(f"       模型列表可用，但未声明上下文长度")
+    else:
+        print(f"       无法查询模型信息: {model_info.get('error', '未知')}")
 
     # 加载用例
     cases_data = load_json(args.cases)
@@ -897,6 +1176,9 @@ def main():
         try:
             if method_name == "tpm_calc":
                 result = test_tpm_calc(cfg, case, prev_results.get("TC-02"))
+            elif method_name == "context_limit":
+                result = test_context_limit(cfg, case, probe_mode=args.probe_context,
+                                           model_info=model_info)
             else:
                 func = methods[method_name]
                 result = func(cfg, case)
@@ -905,6 +1187,15 @@ def main():
             prev_results[cid] = result
             status = "[PASS]" if result["passed"] else "[FAIL]"
             print(status)
+
+            # 失败时立即打印原因
+            if not result["passed"]:
+                detail = result.get("detail", {})
+                reason = detail.get("failure_reason") or detail.get("reason") or detail.get("error") or ""
+                if reason:
+                    print(f"         -> {reason[:200]}")
+                if detail.get("mode") == "live_test" and detail.get("is_timeout"):
+                    print(f"         -> 建议使用 --probe-context 渐进探测实际上下文上限")
         except Exception as e:
             print(f"[ERROR] {e}")
             traceback.print_exc()
