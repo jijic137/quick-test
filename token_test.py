@@ -129,9 +129,9 @@ def parse_args():
     )
     parser.add_argument(
         "--context-tokens",
-        type=int,
+        type=_parse_token_count,
         default=defaults["context_tokens"],
-        help="上下文验收阈值 tokens (默认: 512000)",
+        help="上下文验收阈值, 支持 k/m 后缀。例: 128k, 1m, 512000 (默认: 512000)",
     )
     parser.add_argument(
         "--probe-context",
@@ -175,6 +175,16 @@ def _load_config_defaults() -> dict:
         "timeout": api.get("timeout", builtin["timeout"]),
         "context_tokens": ctx.get("target_tokens", builtin["context_tokens"]),
     }
+
+
+def _parse_token_count(value: str) -> int:
+    """解析 --context-tokens 参数，支持后缀 k(=x1000) m(=x1000000)。"""
+    value = value.strip().lower()
+    if value.endswith("k"):
+        return int(float(value[:-1]) * 1000)
+    elif value.endswith("m"):
+        return int(float(value[:-1]) * 1000 * 1000)
+    return int(value)
 
 # ---------------------------------------------------------------------------
 # 数据加载
