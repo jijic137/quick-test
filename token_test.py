@@ -57,6 +57,86 @@ TZ_BJ = timezone(timedelta(hours=8))
 _stats_lock = threading.Lock()
 _req_counter = [0]  # 全局请求计数器（用 list 避免 nonlocal）
 
+# ── 基准测试参考文本（足够长，用于生成不同长度的输入）──
+_BENCH_BASE_TEXT = (
+    "You are a senior software engineer with expertise in system design, "
+    "distributed systems, databases, networking, security, and machine learning. "
+    "You provide clear, well-structured technical explanations with practical examples.\n\n"
+    "The following is a technical reference covering key computer science topics:\n\n"
+    "## System Design Principles\n"
+    "Scalability: horizontal vs vertical scaling. Horizontal scaling adds more machines "
+    "to distribute load (scale out), while vertical scaling adds more resources to a "
+    "single machine (scale up). Stateless services are easier to scale horizontally. "
+    "Stateful services require careful partitioning and replication strategies.\n\n"
+    "Availability: measured in nines (99.9% = 8.76h downtime/year, 99.99% = 52min/year). "
+    "Achieved through redundancy, failover mechanisms, health checks, circuit breakers, "
+    "and graceful degradation. Active-active and active-passive are common HA patterns.\n\n"
+    "Consistency: strong consistency guarantees all reads see the latest write (CP systems). "
+    "Eventual consistency allows temporary inconsistencies for better availability (AP systems). "
+    "Consensus algorithms (Paxos, Raft) provide strong consistency in distributed systems.\n\n"
+    "## Database Design\n"
+    "SQL databases (PostgreSQL, MySQL) provide ACID transactions and rich querying. "
+    "NoSQL databases (MongoDB, Cassandra) offer flexible schemas and horizontal scaling. "
+    "Indexing strategies: B-tree for range queries, hash for equality, GiST for geospatial. "
+    "Query optimization: EXPLAIN ANALYZE, proper indexing, avoiding N+1 queries, connection pooling.\n\n"
+    "## API Design\n"
+    "REST: resources as URLs, HTTP methods as actions. GraphQL: client-specified queries. "
+    "gRPC: high-performance RPC with Protocol Buffers. Rate limiting: token bucket, "
+    "leaky bucket, fixed/sliding window. Authentication: JWT, OAuth 2.0, API keys, mTLS.\n\n"
+    "## Networking\n"
+    "TCP: connection-oriented, reliable delivery, flow control, congestion control. "
+    "UDP: connectionless, low latency, no guarantees. HTTP/1.1: persistent connections, "
+    "pipelining. HTTP/2: multiplexing, header compression, server push. HTTP/3: QUIC, "
+    "improved multiplexing. DNS: hierarchical naming, caching, load balancing via DNS.\n\n"
+    "## Security\n"
+    "Defense in depth: multiple layers of security controls. Principle of least privilege: "
+    "minimal permissions required. Common vulnerabilities: SQL injection, XSS, CSRF, SSRF. "
+    "Mitigations: parameterized queries, output encoding, CSRF tokens, input validation.\n\n"
+    "## Observability\n"
+    "Three pillars: logging (structured event records), metrics (numeric time-series), "
+    "tracing (request flow across services). Key metrics: latency, throughput, error rate, "
+    "saturation. SLO/SLI/SLA: service level objectives, indicators, agreements.\n\n"
+    "## CI/CD\n"
+    "Continuous Integration: frequent merges, automated builds and tests. Continuous "
+    "Delivery: automated deployment pipeline. Deployment strategies: blue-green, canary, "
+    "rolling updates, feature flags. Infrastructure as Code: Terraform, Pulumi, CloudFormation.\n\n"
+)
+
+_GEN_BENCH_SYSTEM = {}  # 缓存不同长度的 system prompt
+
+
+def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None):
+    """生成指定输入长度的 messages，用于压测和流式测试。
+    system prompt 填充到 (target_input_tokens - user_tokens) 左右。
+    返回 (messages, estimated_input_tokens)。
+    """
+    if user_question is None:
+        user_question = (
+            "Based on the technical reference provided above, please write a comprehensive "
+            "summary covering the most important concepts across all sections. Include "
+            "specific technical details and best practices. Write about 250-300 words."
+        )
+    user_tokens = max(50, len(user_question.split()) * 3 // 2)  # 粗略估算
+
+    system_target = max(500, target_input_tokens - user_tokens)
+
+    # 缓存 key 取最接近的 500 token 档位
+    cache_key = (system_target // 500) * 500
+    if cache_key in _GEN_BENCH_SYSTEM:
+        system_text = _GEN_BENCH_SYSTEM[cache_key]
+    else:
+        # 重复填充到目标长度（英文 ~0.75 token/word ≈ 4 chars/token）
+        needed_chars = system_target * 4
+        repeats = max(1, needed_chars // len(_BENCH_BASE_TEXT) + 1)
+        system_text = _BENCH_BASE_TEXT * repeats
+        _GEN_BENCH_SYSTEM[cache_key] = system_text
+
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_question},
+    ]
+
+
 # ── 工具函数 ────────────────────────────────────────────────
 
 def _gen_request_id() -> str:
@@ -81,6 +161,37 @@ def _percentiles(data: list, *ps) -> dict:
 # ---------------------------------------------------------------------------
 # 参数解析
 # ---------------------------------------------------------------------------
+def _preprocess_argv() -> list:
+    """
+    预处理命令行参数：将 -k / --key 后的空格分隔部分合并为一个 token，
+    解决 `-k x-api-key: 1232113`（无引号含空格）被 shell 拆成两个参数的问题。
+    同时兼容 `-k "x-api-key: 1232113"` 和 `-k sk-plain-key`。
+    """
+    raw = sys.argv[1:]
+    if not raw:
+        return raw
+
+    flags_needing_join = {"-k", "--key"}
+    merged = []
+    i = 0
+    while i < len(raw):
+        arg = raw[i]
+        if arg in flags_needing_join and i + 1 < len(raw):
+            # 收集后续非 flag 的 token 合并到 key 值
+            parts = []
+            j = i + 1
+            while j < len(raw) and raw[j] not in flags_needing_join and not raw[j].startswith("-"):
+                parts.append(raw[j])
+                j += 1
+            merged.append(arg)
+            merged.append(" ".join(parts))
+            i = j
+        else:
+            merged.append(arg)
+            i += 1
+    return merged
+
+
 def parse_args():
     """解析命令行参数，未提供的参数从 test_config.json 取默认值。"""
     # 先从配置文件读取默认值
@@ -156,13 +267,19 @@ def parse_args():
         help="上下文验收阈值, 支持 k/m 后缀。例: 128k, 1m, 512000 (默认: 512000)",
     )
     parser.add_argument(
+        "--input-tokens",
+        type=_parse_token_count,
+        default=defaults["input_tokens"],
+        help="压测/流式测试的输入 token 数，支持 k/m 后缀。例: 1k, 8k, 50k (默认: 1k)",
+    )
+    parser.add_argument(
         "--probe-context",
         action="store_true",
         default=False,
         help="启用渐进式上下文探测：从小量递增直到找到实际上限（较慢但精确）",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(_preprocess_argv())
 
 
 def _load_config_defaults() -> dict:
@@ -175,6 +292,7 @@ def _load_config_defaults() -> dict:
         "total_requests": 20,
         "timeout": 60,
         "context_tokens": 512000,
+        "input_tokens": 1000,  # 1k
     }
     if not CONFIG_PATH.exists():
         return builtin
@@ -196,6 +314,7 @@ def _load_config_defaults() -> dict:
         "total_requests": bench.get("total_requests", builtin["total_requests"]),
         "timeout": api.get("timeout", builtin["timeout"]),
         "context_tokens": ctx.get("target_tokens", builtin["context_tokens"]),
+        "input_tokens": bench.get("input_tokens", builtin["input_tokens"]),
     }
 
 
@@ -588,6 +707,7 @@ def build_cfg(args) -> dict:
         "benchmark": {
             "concurrency": args.concurrency,
             "total_requests": args.requests,
+            "input_tokens": args.input_tokens,
         },
         "context_test": {
             "target_tokens": args.context_tokens,
@@ -629,8 +749,10 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
     params = case.get("params", {})
     concurrency = cfg["benchmark"].get("concurrency", params.get("concurrency", 4))
     total = cfg["benchmark"].get("total_requests", params.get("total_requests", 20))
-    max_tokens = params.get("max_tokens", 100)
-    messages = params.get("messages", [{"role": "user", "content": "Hi"}])
+    input_tokens = cfg["benchmark"].get("input_tokens", 1000)
+    # 输出与输入成比例：输入越长，输出也适当增加（但 cap 在 500）
+    max_tokens = min(500, max(params.get("max_tokens", 300), input_tokens // 3))
+    messages = _gen_benchmark_messages(input_tokens)
 
     stats = {
         "total": total,
@@ -1100,8 +1222,9 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
     params = case.get("params", {})
     concurrency = params.get("concurrency", 5)
     total = params.get("total_requests", 10)
-    max_tokens = params.get("max_tokens", 300)
-    messages = params.get("messages", [{"role": "user", "content": "Hello"}])
+    input_tokens = cfg["benchmark"].get("input_tokens", 1000)
+    max_tokens = min(500, max(params.get("max_tokens", 300), input_tokens // 3))
+    messages = _gen_benchmark_messages(input_tokens)
 
     # 每请求指标收集（用于百分位计算）
     per_req_ttft = []        # prefill 延迟
@@ -1245,6 +1368,141 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
             "itl_over_500ms_count": stats["itl_over_500ms"],
             "itl_over_500ms_requests_pct": f"{itl_over_req_pct}%",
             "errors": stats["errors"][:5],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# TC-09: 前缀缓存命中验证
+# ---------------------------------------------------------------------------
+
+_CACHE_SYSTEM_TEXT = (
+    "You are an AI assistant with deep knowledge of software engineering, "
+    "distributed systems, machine learning, and cloud architecture. "
+    "The following is a comprehensive technical reference document.\n\n"
+    "## 1. Distributed Systems\n"
+    "A distributed system is a collection of independent computers that appears "
+    "as a single coherent system. The CAP theorem: Consistency, Availability, "
+    "Partition Tolerance — pick two. Raft consensus: leader election, log "
+    "replication, safety. Paxos: proposers, acceptors, learners, two phases.\n"
+    "## 2. Load Balancing\n"
+    "Round Robin, Least Connections, IP Hash, Weighted variants. Layer 4 (TCP) "
+    "vs Layer 7 (HTTP). Health checks: active and passive.\n"
+    "## 3. Caching\n"
+    "Cache-Aside, Read-Through, Write-Through, Write-Behind. Eviction: LRU, "
+    "LFU, TTL, FIFO. Invalidation: time-based, event-driven, version-based.\n"
+    "## 4. Databases\n"
+    "B-Tree indexes for range queries. Hash indexes for point lookups. Sharding: "
+    "range, hash, directory, geo. Replication: master-slave, master-master, "
+    "synchronous vs asynchronous.\n"
+    "## 5. Message Queues\n"
+    "Kafka: high-throughput, partition-based. RabbitMQ: AMQP, flexible routing. "
+    "SQS: managed, standard/FIFO. Event patterns: notification, event-carried "
+    "state, event sourcing, CQRS.\n"
+    "## 6. API Design\n"
+    "REST: nouns for resources, HTTP methods for actions. Rate limiting: token "
+    "bucket, fixed window, sliding window. Auth: API keys, JWT, OAuth 2.0, mTLS.\n"
+    "## 7. Observability\n"
+    "Three pillars: logging, metrics, tracing. RED: Rate, Errors, Duration. "
+    "USE: Utilization, Saturation, Errors. Four Golden Signals: latency, "
+    "traffic, errors, saturation. Alert on symptoms, not causes.\n"
+    "## 8. Security\n"
+    "Defense in depth. Principle of least privilege. Zero trust architecture. "
+    "SQL injection prevention: parameterized queries. XSS: output encoding. "
+    "CSRF: tokens. Authentication vs authorization. Encryption at rest and "
+    "in transit. Certificate management and rotation.\n"
+    "## 9. CI/CD\n"
+    "Continuous Integration: frequent merges, automated builds and tests. "
+    "Continuous Delivery: automated deployment to staging. Continuous "
+    "Deployment: automated production deployment. Blue-green, canary, "
+    "rolling deployments. Feature flags for gradual rollouts.\n"
+    "## 10. Performance\n"
+    "Amdahl's Law: speedup limited by serial portion. Gustafson's Law: "
+    "larger problems benefit more from parallelism. Little's Law: L = λW. "
+    "Percentile-based SLOs: p50, p95, p99. Tail latency amplification "
+    "in microservices. Connection pooling and HTTP keep-alive.\n"
+    "[End Reference]\n"
+)
+
+_GEN_CACHE_SYSTEM = ""
+
+
+def _cache_system_prompt(target_tokens: int = 3000) -> str:
+    """生成长 system prompt（约 target_tokens token），用于缓存命中测试。"""
+    global _GEN_CACHE_SYSTEM
+    if _GEN_CACHE_SYSTEM:
+        return _GEN_CACHE_SYSTEM
+    # 英文 ~0.75 token/word ≈ 4 chars/token，重复直到够长
+    needed_chars = target_tokens * 4
+    repeats = max(1, needed_chars // len(_CACHE_SYSTEM_TEXT) + 1)
+    _GEN_CACHE_SYSTEM = _CACHE_SYSTEM_TEXT * repeats
+    return _GEN_CACHE_SYSTEM
+
+
+def test_cache_hit(cfg: dict, case: dict) -> dict:
+    """TC-09: 相同长 system prompt 发两次流式请求，验证前缀缓存命中。"""
+    api = cfg["api"]
+    params = case.get("params", {})
+    max_tokens = params.get("max_tokens", 100)
+    target_tokens = params.get("system_prompt_tokens", 3000)
+    timeout = api.get("timeout", 120)
+
+    system_text = _cache_system_prompt(target_tokens)
+    user_content = params.get("messages", [{"role": "user", "content": "Summarize."}])[0].get("content", "Summarize.")
+
+    messages = [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_content},
+    ]
+
+    def _do(label: str) -> dict:
+        t0 = time.perf_counter()
+        r = api_request_stream(
+            url=api["url"], key=api["key"], model=api["model"],
+            messages=messages, max_tokens=max_tokens, timeout=timeout,
+        )
+        return {
+            "label": label, "ok": r["ok"],
+            "ttft": r["ttft"], "total_latency": r["total_latency"],
+            "prompt_tokens": r["prompt_tokens"],
+            "completion_tokens": r["completion_tokens"],
+            "cached_tokens": r.get("cached_tokens", 0),
+            "error": r.get("error"),
+        }
+
+    req1 = _do("冷启动")
+    time.sleep(0.3)
+    req2 = _do("缓存命中")
+
+    both_ok = req1["ok"] and req2["ok"]
+    cached = req2.get("cached_tokens", 0)
+    cache_hit = cached > 0
+
+    ttft_reduction = 0.0
+    if both_ok and req1["ttft"] > 0:
+        ttft_reduction = round((req1["ttft"] - req2["ttft"]) / req1["ttft"] * 100, 1)
+
+    if cache_hit:
+        verdict = (
+            f"缓存命中: cached_tokens={cached}, "
+            f"TTFT {req1['ttft']}s → {req2['ttft']}s (降 {ttft_reduction}%)"
+        )
+    elif both_ok:
+        verdict = (
+            f"未命中: cached_tokens={cached}, "
+            f"TTFT {req1['ttft']}s → {req2['ttft']}s"
+        )
+    else:
+        verdict = "请求失败"
+
+    return {
+        "case_id": case["id"],
+        "passed": both_ok and cache_hit,
+        "detail": {
+            "request1": req1, "request2": req2,
+            "cached_tokens": cached, "cache_hit": cache_hit,
+            "ttft_reduction_pct": f"{ttft_reduction}%" if both_ok else "N/A",
+            "verdict": verdict,
         },
     }
 
@@ -1452,6 +1710,17 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                     f"ITL>500ms={detail.get('itl_over_500ms_count')}次({detail.get('itl_over_500ms_requests_pct')}请求), "
                     f"Cache命中={detail.get('cache_hit_rate')}"
                 )
+            elif cid == "TC-09":
+                r1 = detail.get("request1", {}) or {}
+                r2 = detail.get("request2", {}) or {}
+                actual = (
+                    f"{'[HIT]' if detail.get('cache_hit') else '[MISS]'} "
+                    f"cached_tokens={detail.get('cached_tokens', 0)}, "
+                    f"TTFT: {r1.get('ttft', 'N/A')}s → {r2.get('ttft', 'N/A')}s "
+                    f"(降{detail.get('ttft_reduction_pct', 'N/A')})"
+                )
+                if detail.get("verdict"):
+                    actual += f" | {detail['verdict'][:120]}"
             else:
                 actual = json.dumps(detail, ensure_ascii=False)
 
@@ -1477,7 +1746,7 @@ SUMMARY_COLUMNS = [
     "TTFT (s)", "ITL (ms)", "TPOT (ms/tok)",
     "TC-01 连通性", "TC-02 TPS压测", "TC-03 TPM换算",
     "TC-04 上下文", "TC-05 鉴权", "TC-06 限流",
-    "TC-07 工具调用", "TC-08 流式性能",
+    "TC-07 工具调用", "TC-08 流式性能", "TC-09 缓存命中",
     "总通过", "总失败", "测试结论",
 ]
 
@@ -1580,6 +1849,7 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
         case_status.get("TC-06", ""),
         case_status.get("TC-07", ""),
         case_status.get("TC-08", ""),
+        case_status.get("TC-09", ""),
         str(passed_cases),
         str(failed_cases),
         conclusion,
@@ -1610,6 +1880,7 @@ def main():
     print(f"  Model:    {cfg['api']['model']}")
     print(f"  Timeout:  {cfg['api']['timeout']}s")
     print(f"  并发/请求: {cfg['benchmark']['concurrency']}/{cfg['benchmark']['total_requests']}")
+    print(f"  输入 tokens: {cfg['benchmark'].get('input_tokens', 1000)}")
     print(f"  上下文阈值: {cfg['context_test']['target_tokens']} tokens")
     if args.probe_context:
         print(f"  上下文模式: 渐进式探测")
@@ -1649,6 +1920,7 @@ def main():
         "rate_limit": test_rate_limit,
         "tool_calling": test_tool_calling,
         "streaming_benchmark": test_streaming_benchmark,
+        "cache_hit": test_cache_hit,
     }
 
     results = []

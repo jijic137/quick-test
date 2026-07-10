@@ -22,7 +22,7 @@
       "id": "TC-02",
       "name": "TPS 压测",
       "type": "性能",
-      "input": "并发={{concurrency}} 总请求={{total_requests}}，模拟真实对话场景（输入 ~450 tokens，输出 ~300 tokens）",
+      "input": "并发={{concurrency}} 总请求={{total_requests}}，输入长度由 --input-tokens 控制（默认 1k）",
       "expected": "TPS/TPM 数值有效，成功率>0",
       "method": "tps_benchmark",
       "params": {
@@ -124,7 +124,7 @@
       "id": "TC-08",
       "name": "流式性能测试",
       "type": "性能",
-      "input": "流式请求，测量 Prefill/Decode 两阶段指标 + 百分位 + 缓存命中 + 包间延迟",
+      "input": "流式请求，输入长度由 --input-tokens 控制（默认 1k），测量 Prefill/Decode + 百分位",
       "expected": "TTFT p50/p90/p99 < 30s, TPOT p50 > 50 tok/s, ITL max < 500ms",
       "method": "streaming_benchmark",
       "params": {
@@ -134,6 +134,21 @@
         "messages": [
           {"role": "system", "content": "You are a helpful assistant. Provide clear, concise answers."},
           {"role": "user", "content": "Explain what a Transformer model is and how the self-attention mechanism works. Include key concepts like Q, K, V matrices, multi-head attention, and positional encoding. Write about 250-300 words."}
+        ]
+      }
+    },
+    {
+      "id": "TC-09",
+      "name": "前缀缓存命中",
+      "type": "功能",
+      "input": "~3k token system prompt 发两次流式请求，第二次应有前缀缓存命中",
+      "expected": "第 2 次 cached_tokens > 0，TTFT 降低 > 30%",
+      "method": "cache_hit",
+      "params": {
+        "max_tokens": 100,
+        "system_prompt_tokens": 3000,
+        "messages": [
+          {"role": "user", "content": "Based on the context provided, summarize the key points in 3-5 bullet points. Keep each bullet under 15 words."}
         ]
       }
     }
