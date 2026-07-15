@@ -142,11 +142,11 @@
       "name": "前缀缓存命中",
       "type": "功能",
       "input": "~3k token system prompt 发两次流式请求，第二次应有前缀缓存命中",
-      "expected": "观测模式：基于 TTFT 下降 >30% 判断缓存命中（不依赖 cached_tokens 字段）",
+      "expected": "第 2/3 次请求 prompt_tokens_details.cached_tokens > 0，命中率 > 50%",
       "method": "cache_hit",
       "params": {
         "max_tokens": 100,
-        "system_prompt_tokens": 3000,
+        "system_prompt_tokens": 5000,
         "messages": [
           {"role": "user", "content": "Based on the context provided, summarize the key points in 3-5 bullet points. Keep each bullet under 15 words."}
         ]

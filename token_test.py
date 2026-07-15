@@ -510,9 +510,11 @@ def api_request_stream(url: str, key: str, model: str, messages: list,
 
             now = time.perf_counter()
 
-            # 首 token 时间
+            # 首 token 时间 — 兼容 content 和 reasoning_content
             choices = chunk.get("choices", [])
-            if choices and choices[0].get("delta", {}).get("content"):
+            delta = choices[0].get("delta", {}) if choices else {}
+            has_content = delta.get("content") or delta.get("reasoning_content")
+            if has_content:
                 if first_token is None:
                     first_token = now
                 last_token_time = now
@@ -525,9 +527,12 @@ def api_request_stream(url: str, key: str, model: str, messages: list,
                 result["prompt_tokens"] = int(u.get("prompt_tokens", 0))
                 result["completion_tokens"] = int(u.get("completion_tokens", 0))
                 result["total_tokens"] = int(u.get("total_tokens", 0))
-                # 提取缓存命中 token 数
+                # 提取缓存命中（prompt_tokens_details.cached_tokens，大多 API 不返回）
                 ptd = u.get("prompt_tokens_details") or u.get("prompt_tokens_detail") or {}
                 result["cached_tokens"] = int(ptd.get("cached_tokens", 0))
+                # 推理模型兼容：优先用 usage 里的 completion_tokens
+                if result["completion_tokens"] == 0:
+                    result["completion_tokens"] = int(u.get("completion_tokens", 0))
 
         result["total_latency"] = round(time.perf_counter() - t_start, 3)
         result["ok"] = first_token is not None
@@ -1531,19 +1536,19 @@ def _cache_system_prompt(target_tokens: int = 3000) -> str:
 
 
 def test_cache_hit(cfg: dict, case: dict) -> dict:
-    """TC-09: 前缀缓存观测 — 发两次相同 system prompt 的流式请求，通过 TTFT 对比判断是否命中。
+    """TC-09: 前缀缓存命中率测试。
 
-    不依赖 cached_tokens 字段（大多数 API 不返回），改为观测 TTFT 下降幅度：
-      - 第 2 次 TTFT 下降 > 30%  → 认定为「命中」
-      - 下降 ≤ 30% 或反而更慢  → 认定为「未命中」
-    同时记录 cached_tokens 字段作为辅助参考（可能为 null/0）。
+    发 3 次相同长 system prompt（~5000 tokens，远超 256 的缓存块粒度）的流式请求：
+      - 第 1 次：冷启动，填充缓存
+      - 第 2、3 次：应有缓存命中，提取 cached_tokens 计算命中率
 
-    通过条件（观测模式）：两次请求均成功即可 — 缓存命中与否不作为硬性判定条件。
+    命中率 = cached_tokens / prompt_tokens × 100%
+    通过条件: 有缓存命中（cached_tokens > 0）且请求成功。
     """
     api = cfg["api"]
     params = case.get("params", {})
-    max_tokens = params.get("max_tokens", 100)
-    target_tokens = params.get("system_prompt_tokens", 3000)
+    max_tokens = params.get("max_tokens", 50)
+    target_tokens = params.get("system_prompt_tokens", 5000)  # 足够长，超过 256 缓存粒度
     timeout = api.get("timeout", 120)
 
     system_text = _cache_system_prompt(target_tokens)
@@ -1555,22 +1560,25 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
     ]
 
     def _do(label: str) -> dict:
-        t0 = time.perf_counter()
         r = api_request_stream(
             url=api["url"], key=api["key"], model=api["model"],
             messages=messages, max_tokens=max_tokens, timeout=timeout,
         )
+        cached = r.get("cached_tokens", 0)
+        prompt = r.get("prompt_tokens", 1)
+        hit_rate = round(cached / prompt * 100, 1) if prompt > 0 else 0.0
         return {
             "label": label, "ok": r["ok"],
             "ttft": r["ttft"], "total_latency": r["total_latency"],
-            "prompt_tokens": r["prompt_tokens"],
-            "completion_tokens": r["completion_tokens"],
-            "cached_tokens": r.get("cached_tokens", 0),
+            "prompt_tokens": prompt,
+            "completion_tokens": r.get("completion_tokens", 0),
+            "cached_tokens": cached,
+            "cache_hit_rate": hit_rate,
             "error": r.get("error"),
         }
 
-    # 发 3 次，用第 1 次预热（冷启动），后面两次看是否趋于稳定（命中）
-    req1 = _do("预热")
+    # 发 3 次：第 1 次冷启动，第 2/3 次应有缓存命中
+    req1 = _do("冷启动")
     time.sleep(0.3)
     req2 = _do("第2次")
     time.sleep(0.3)
@@ -1578,59 +1586,56 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
 
     all_ok = req1["ok"] and req2["ok"] and req3["ok"]
 
-    # ── 基于 TTFT 判断缓存命中 ──
-    ttft_1_to_2 = 0.0   # 第 2 次 vs 第 1 次
-    ttft_2_to_3 = 0.0   # 第 3 次 vs 第 2 次
-    cache_1_2 = False
-    cache_2_3 = False
+    # ── 缓存命中判定 ──
+    # 优先用 prompt_tokens_details.cached_tokens 字段
+    field_hit_2 = req2.get("cached_tokens", 0) > 0
+    field_hit_3 = req3.get("cached_tokens", 0) > 0
+    cache_hit = field_hit_2 or field_hit_3
 
-    if all_ok and req1["ttft"] > 0:
-        ttft_1_to_2 = round((req1["ttft"] - req2["ttft"]) / req1["ttft"] * 100, 1)
-        cache_1_2 = ttft_1_to_2 > 30
-    if all_ok and req2["ttft"] > 0:
-        ttft_2_to_3 = round((req2["ttft"] - req3["ttft"]) / req2["ttft"] * 100, 1)
-        cache_2_3 = ttft_2_to_3 > 30
+    # 取两次中较高的命中率
+    best_rate = max(req2.get("cache_hit_rate", 0), req3.get("cache_hit_rate", 0))
+    cached_total = max(req2.get("cached_tokens", 0), req3.get("cached_tokens", 0))
 
-    # 第 2 次或第 3 次任一命中即认为有缓存
-    cache_hit = cache_1_2 or cache_2_3
+    # ── TTFT 对比作为辅助验证 ──
+    ttft_1_to_2 = round((req1["ttft"] - req2["ttft"]) / req1["ttft"] * 100, 1) if req1["ttft"] > 0 and all_ok else 0
+    ttft_2_to_3 = round((req2["ttft"] - req3["ttft"]) / req2["ttft"] * 100, 1) if req2.get("ttft", 0) > 0 and all_ok else 0
+    ttft_confirms = ttft_1_to_2 > 30 or ttft_2_to_3 > 30
 
-    # ── cached_tokens 字段作为辅助参考 ──
-    field_cached_1 = req1.get("cached_tokens", 0)
-    field_cached_2 = req2.get("cached_tokens", 0)
-    field_cached_3 = req3.get("cached_tokens", 0)
-    field_cache_hit = field_cached_2 > 0 or field_cached_3 > 0
-
-    # ── 判定方式 ──
-    if field_cache_hit:
-        detect_method = "字段检测"
-    elif cache_hit:
-        detect_method = "TTFT分析"
+    if cache_hit:
+        detect_method = "prompt_tokens_details"
+    elif ttft_confirms:
+        detect_method = "TTFT"
     else:
         detect_method = "未命中"
 
     if all_ok:
-        verdict_parts = []
-        verdict_parts.append(f"TTFT: {req1['ttft']}s → {req2['ttft']}s → {req3['ttft']}s")
-        verdict_parts.append(f"第2次降{ttft_1_to_2}%{' (命中)' if cache_1_2 else ''}")
-        verdict_parts.append(f"第3次降{ttft_2_to_3}%{' (命中)' if cache_2_3 else ''}")
-        if field_cache_hit:
-            verdict_parts.append(f"cached_tokens: [{field_cached_1}, {field_cached_2}, {field_cached_3}]")
+        verdict_parts = [
+            f"命中率={best_rate}%",
+            f"cached={cached_total}/{req2.get('prompt_tokens', '?')} tokens",
+        ]
+        verdict_parts.append(
+            f"TTFT: {req1['ttft']}s→{req2['ttft']}s→{req3['ttft']}s"
+            f"(降{ttft_1_to_2}%/降{ttft_2_to_3}%)"
+        )
         verdict = " | ".join(verdict_parts)
     else:
         verdict = "请求失败"
 
     return {
         "case_id": case["id"],
-        "passed": True,  # 观测模式：始终为观测通过
+        "passed": all_ok and cache_hit,
         "detail": {
+            "detect_method": detect_method,
             "request1": req1,
             "request2": req2,
             "request3": req3,
-            "detect_method": detect_method,
-            "cache_hit": cache_hit or field_cache_hit,
-            "field_cached_tokens": [field_cached_1, field_cached_2, field_cached_3],
+            "cache_hit": cache_hit,
+            "cache_hit_rate_pct": best_rate,
+            "cached_tokens_max": cached_total,
+            "prompt_tokens": req2.get("prompt_tokens", 0),
             "ttft_1_to_2_pct": f"{ttft_1_to_2}%",
             "ttft_2_to_3_pct": f"{ttft_2_to_3}%",
+            "ttft_confirms": ttft_confirms,
             "verdict": verdict,
         },
     }
@@ -1864,10 +1869,9 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 r3 = detail.get("request3", {}) or {}
                 actual = (
                     f"[{detail.get('detect_method', 'N/A')}] "
-                    f"TTFT: {r1.get('ttft', 'N/A')}s → {r2.get('ttft', 'N/A')}s → {r3.get('ttft', 'N/A')}s, "
-                    f"第2次降{detail.get('ttft_1_to_2_pct', 'N/A')}, "
-                    f"第3次降{detail.get('ttft_2_to_3_pct', 'N/A')}, "
-                    f"cached_tokens字段: {detail.get('field_cached_tokens', 'N/A')}"
+                    f"缓存命中率: {detail.get('cache_hit_rate_pct', 'N/A')}%, "
+                    f"cached={detail.get('cached_tokens_max', 0)}/{detail.get('prompt_tokens', '?')} tokens, "
+                    f"TTFT: {r1.get('ttft', 'N/A')}s→{r2.get('ttft', 'N/A')}s→{r3.get('ttft', 'N/A')}s"
                 )
                 if detail.get("verdict"):
                     actual += f" | {detail['verdict'][:150]}"
@@ -1975,15 +1979,14 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
             decode_tps_s = str(d.get("decode_tps", "N/A"))
             cache_rate_s = str(d.get("cache_hit_rate", "N/A"))
 
-    # ── 如果 TC-09 有缓存命中，更新缓存命中率列 ──
+    # ── 如果 TC-09 有缓存命中率，优先用 TC-09 的 ──
     for r in results:
         if r.get("case_id") == "TC-09" and r.get("detail"):
             d = r["detail"]
-            method = d.get("detect_method", "")
             if d.get("cache_hit"):
-                cache_rate_s = f"命中({method})"
+                cache_rate_s = f"{d.get('cache_hit_rate_pct', 'N/A')}%"
             else:
-                cache_rate_s = f"未命中({method})"
+                cache_rate_s = f"未命中({d.get('detect_method', 'N/A')})"
 
     return [
         cfg["api"].get("model", ""),
