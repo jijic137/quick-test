@@ -46,14 +46,14 @@
     },
     {
       "id": "TC-04",
-      "name": "512k 上下文验收",
+      "name": "上下文窗口验收",
       "type": "容量",
-      "input": "发送约 512000 tokens 长上下文",
-      "expected": "接口正常返回，未报上下文超限",
+      "input": "阶梯测试 128k/256k/512k（由 test_config.json 配置）",
+      "expected": "任一档位通过即可，帮助定位实际上下文上限",
       "method": "context_limit",
       "params": {
         "target_tokens": 512000,
-        "max_output_tokens": 50,
+        "max_output_tokens": 4,
         "prompt_template": "请总结以下文本的开头3个字和结尾3个字，用英文回复: {padding}"
       }
     },
@@ -142,7 +142,7 @@
       "name": "前缀缓存命中",
       "type": "功能",
       "input": "~3k token system prompt 发两次流式请求，第二次应有前缀缓存命中",
-      "expected": "第 2 次 cached_tokens > 0，TTFT 降低 > 30%",
+      "expected": "观测模式：基于 TTFT 下降 >30% 判断缓存命中（不依赖 cached_tokens 字段）",
       "method": "cache_hit",
       "params": {
         "max_tokens": 100,

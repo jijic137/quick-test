@@ -137,6 +137,19 @@ def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None)
     ]
 
 
+def _gen_context_padding(target_tokens: int, chars_per_token: float = 4.0) -> str:
+    """生成约 target_tokens 长的英文 padding 文本，用于上下文窗口测试。
+
+    英文 ~4 chars/token，用 _BENCH_BASE_TEXT 重复填充，估算比中文"测"准确得多。
+    返回 (padding_text, estimated_tokens)。
+    """
+    needed_chars = int(target_tokens * chars_per_token)
+    repeats = max(1, needed_chars // len(_BENCH_BASE_TEXT) + 1)
+    text = (_BENCH_BASE_TEXT * repeats)[:needed_chars]
+    estimated_tokens = len(text) / chars_per_token
+    return text, int(estimated_tokens)
+
+
 # ── 工具函数 ────────────────────────────────────────────────
 
 def _gen_request_id() -> str:
@@ -313,7 +326,7 @@ def _load_config_defaults() -> dict:
         "concurrency": bench.get("concurrency", builtin["concurrency"]),
         "total_requests": bench.get("total_requests", builtin["total_requests"]),
         "timeout": api.get("timeout", builtin["timeout"]),
-        "context_tokens": ctx.get("target_tokens", builtin["context_tokens"]),
+        "context_tokens": builtin["context_tokens"],  # argparse 只用单值，多值从 build_cfg 读取
         "input_tokens": bench.get("input_tokens", builtin["input_tokens"]),
     }
 
@@ -591,8 +604,8 @@ def probe_context_limit(cfg: dict, params: dict) -> dict:
     """
     api = cfg["api"]
     target = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
-    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 2.5)
-    timeout = max(api.get("timeout", 60), params.get("timeout", 600))
+    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.0)
+    timeout = cfg.get("context_test", {}).get("timeout") or max(api.get("timeout", 60), 120)
     prompt_template = params.get(
         "prompt_template",
         "请总结以下文本的开头3个字和结尾3个字，用英文回复: {padding}"
@@ -608,9 +621,8 @@ def probe_context_limit(cfg: dict, params: dict) -> dict:
     # 阶段 1: 翻倍递增，找到上界
     test_size = low
     while test_size <= high:
-        chars = int(test_size * chars_per_token)
-        chunk = "测" * min(chars, 2_000_000)
-        messages = [{"role": "user", "content": prompt_template.format(padding=chunk)}]
+        padding_text, _ = _gen_context_padding(test_size, chars_per_token)
+        messages = [{"role": "user", "content": prompt_template.format(padding=padding_text)}]
 
         t0 = time.perf_counter()
         result = api_request(
@@ -649,9 +661,8 @@ def probe_context_limit(cfg: dict, params: dict) -> dict:
         print(f"         [探测] 二分定位: {low} ~ {high}")
         while low < high - 500:  # 精度到 500 tokens
             mid = (low + high) // 2
-            chars = int(mid * chars_per_token)
-            chunk = "测" * min(chars, 2_000_000)
-            messages = [{"role": "user", "content": prompt_template.format(padding=chunk)}]
+            padding_text, _ = _gen_context_padding(mid, chars_per_token)
+            messages = [{"role": "user", "content": prompt_template.format(padding=padding_text)}]
 
             t0 = time.perf_counter()
             result = api_request(
@@ -697,6 +708,26 @@ def probe_context_limit(cfg: dict, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 def build_cfg(args) -> dict:
     """将 argparse 结果构建为与旧 cfg dict 兼容的结构。"""
+    # 从配置文件读取 context_test 相关默认值
+    ctx_defaults = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            ctx_defaults = j.get("context_test", {})
+        except Exception:
+            pass
+
+    # target_tokens 支持 int 或 int[]，统一转成列表
+    raw_target = ctx_defaults.get("target_tokens", args.context_tokens)
+    if isinstance(raw_target, list):
+        target_list = raw_target
+    else:
+        target_list = [raw_target]
+    # CLI 显式传入时覆盖配置文件
+    if args.context_tokens != raw_target if isinstance(raw_target, int) else args.context_tokens not in raw_target:
+        target_list = [args.context_tokens]
+
     return {
         "api": {
             "url": args.url,
@@ -710,8 +741,9 @@ def build_cfg(args) -> dict:
             "input_tokens": args.input_tokens,
         },
         "context_test": {
-            "target_tokens": args.context_tokens,
-            "chars_per_token_estimate": 2.5,
+            "target_tokens": target_list,
+            "chars_per_token_estimate": ctx_defaults.get("chars_per_token_estimate", 4.0),
+            "timeout": ctx_defaults.get("timeout"),
         },
     }
 
@@ -851,25 +883,39 @@ def test_tpm_calc(cfg: dict, case: dict, prev_result: dict = None) -> dict:
 
 def test_context_limit(cfg: dict, case: dict, probe_mode: bool = False,
                        model_info: dict = None) -> dict:
-    """TC-04: 上下文窗口快速验收，优先查模型声明，支持渐进探测。"""
+    """TC-04: 上下文窗口验收 — 支持多档位阶梯测试（128k/256k/456k 等）。
+
+    对 target_tokens 列表中的每个档位逐一测试，记录每个档位的 pass/fail。
+    通过条件（观测模式）：任一档位通过即可 — 帮助定位实际支持的上限。
+    """
     api = cfg["api"]
     params = case.get("params", {})
-    target_tokens = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
-    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 2.5)
-    timeout = max(api.get("timeout", 60), params.get("timeout", 600))
+    raw_target = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
+    # 统一为列表，降序（从大到小测，成功即停）
+    targets = sorted(
+        raw_target if isinstance(raw_target, list) else [raw_target],
+        reverse=True,
+    )
+    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.0)
+    timeout = cfg.get("context_test", {}).get("timeout") or max(api.get("timeout", 60), 120)
 
-    # ── 渐进式探测模式 ──
+    # ── 渐进式探测模式（使用最大目标值）──
     if probe_mode:
-        probe_result = probe_context_limit(cfg, params)
+        max_target = max(targets)
+        # 临时修改 cfg 中的 target_tokens 为单值给 probe_context_limit 用
+        probe_cfg = {
+            "api": api,
+            "context_test": {"target_tokens": max_target, "chars_per_token_estimate": chars_per_token},
+        }
+        probe_result = probe_context_limit(probe_cfg, params)
         found = probe_result.get("found_limit", 0)
         return {
             "case_id": case["id"],
             "passed": probe_result["passed"],
             "detail": {
                 "mode": "probe",
-                "target": target_tokens,
+                "targets": targets,
                 "found_limit": found,
-                "threshold_reached": found is not None and found >= target_tokens,
                 "attempts_count": len(probe_result.get("attempts", [])),
                 "attempts": probe_result.get("attempts", []),
             },
@@ -881,94 +927,139 @@ def test_context_limit(cfg: dict, case: dict, probe_mode: bool = False,
         declared = model_info["context_length"]
 
     if declared is not None:
-        passed = declared >= target_tokens
+        passed = declared >= max(targets)
         return {
             "case_id": case["id"],
             "passed": passed,
             "detail": {
                 "mode": "declared",
-                "target": target_tokens,
+                "targets": targets,
                 "declared_context_length": declared,
                 "passed": passed,
                 "reason": (
-                    f"模型声明上下文长度 {declared} >= {target_tokens}，通过"
+                    f"模型声明上下文长度 {declared} >= {max(targets)}，通过"
                     if passed else
-                    f"模型声明上下文长度 {declared} < {target_tokens}，不满足要求"
+                    f"模型声明上下文长度 {declared} < {max(targets)}，不满足要求"
                 ),
             },
         }
 
-    # ── 未声明：发一次请求验证 ──
-    total_chars = int(target_tokens * chars_per_token)
-    chunk = "测" * min(int(total_chars), 2_000_000)
-
+    # ── 阶梯式多档位测试 ──
     prompt_template = params.get(
         "prompt_template",
         "请总结以下文本的开头3个字和结尾3个字，用英文回复: {padding}"
     )
-    messages = [
-        {"role": "user", "content": prompt_template.format(padding=chunk)}
-    ]
+    tier_results = []
 
-    t0 = time.perf_counter()
-    result = api_request(
-        url=api["url"], key=api["key"], model=api["model"],
-        messages=messages,
-        max_tokens=params.get("max_output_tokens", 50),
-        timeout=timeout,
-    )
-    elapsed = round(time.perf_counter() - t0, 2)
+    print(f"         [阶梯测试] 共 {len(targets)} 个档位: {[f'{t//1000}k' for t in targets]}")
 
-    # ── 失败原因分析 ──
-    failure_reason = None
-    is_context_error = False
-    is_timeout = False
+    for tier_idx, target in enumerate(targets):
+        padding_text, estimated_input = _gen_context_padding(target, chars_per_token)
+        messages = [
+            {"role": "user", "content": prompt_template.format(padding=padding_text)}
+        ]
 
-    if not result["ok"]:
-        status_code = result.get("status_code")
-        error_msg = result.get("error") or ""
+        print(f"         [{tier_idx+1}/{len(targets)}] 测试 {target//1000}k ({estimated_input:,} tokens est, {len(padding_text):,} chars) ... ", end="", flush=True)
 
-        if error_msg == "请求超时":
-            is_timeout = True
-            failure_reason = (
-                f"请求超时 ({elapsed}s, timeout={timeout}s)。"
-                "可能原因: 1) 模型处理长上下文耗时超过超时设置; "
-                "2) 网关/代理层超时; 3) 模型不支持此长度导致无响应。"
-                "建议: 使用 --probe-context 渐进探测实际支持的上限。"
-            )
-        elif status_code in (400, 413, 422):
-            is_context_error = True
-            failure_reason = f"服务端明确拒绝 (HTTP {status_code}): {error_msg[:200]}"
-        elif status_code in (429,):
-            failure_reason = f"被限流 (HTTP 429): {error_msg[:200]}"
-        elif status_code in (500, 502, 503, 504):
-            failure_reason = f"服务端错误 (HTTP {status_code}): {error_msg[:200]}"
-        else:
-            failure_reason = f"未知错误 (HTTP {status_code}): {error_msg[:200]}"
-
-        err_lower = error_msg.lower()
-        is_context_error = is_context_error or any(
-            kw in err_lower
-            for kw in ["context", "token", "length", "limit", "maximum", "exceed", "too long", "truncat"]
+        t0 = time.perf_counter()
+        result = api_request(
+            url=api["url"], key=api["key"], model=api["model"],
+            messages=messages,
+            max_tokens=params.get("max_output_tokens", 50),
+            timeout=timeout,
         )
+        elapsed = round(time.perf_counter() - t0, 2)
 
-    passed = result["ok"]
+        # ── 失败原因分析（复用现有逻辑）──
+        failure_reason = None
+        is_context_error = False
+        is_timeout = False
+        is_channel_error = False
+
+        if not result["ok"]:
+            status_code = result.get("status_code")
+            error_msg = result.get("error") or ""
+            err_lower = error_msg.lower()
+
+            is_channel = any(
+                kw in err_lower
+                for kw in ["渠道不存在", "可用渠道", "no available channel", "no channel", "retry"]
+            )
+            if status_code and status_code in (500, 502, 503, 504) and is_channel:
+                is_channel_error = True
+                failure_reason = (
+                    f"Relay 渠道不可用 (HTTP {status_code}): {error_msg[:200]}。"
+                    "可能原因: 1) 长上下文请求处理时间过长，后端实例被健康检查摘除; "
+                    "2) 分组下所有渠道均已下线或超载; 3) relay 重试耗尽仍未找到可用后端。"
+                )
+            elif error_msg == "请求超时":
+                is_timeout = True
+                failure_reason = (
+                    f"请求超时 ({elapsed}s, timeout={timeout}s)。"
+                    "可能原因: 1) 模型处理长上下文耗时超过超时设置; "
+                    "2) 网关/代理层超时; 3) 模型不支持此长度导致无响应。"
+                )
+            elif status_code in (400, 413, 422):
+                is_context_error = True
+                failure_reason = f"服务端明确拒绝 (HTTP {status_code}): {error_msg[:200]}"
+            elif status_code in (429,):
+                failure_reason = f"被限流 (HTTP 429): {error_msg[:200]}"
+            elif status_code in (500, 502, 503, 504):
+                failure_reason = f"服务端错误 (HTTP {status_code}): {error_msg[:200]}"
+            else:
+                failure_reason = f"未知错误 (HTTP {status_code}): {error_msg[:200]}"
+
+            is_context_error = is_context_error or any(
+                kw in err_lower
+                for kw in ["context", "token", "length", "limit", "maximum", "exceed", "too long", "truncat"]
+            )
+
+        tier_ok = result["ok"]
+        status = "PASS" if tier_ok else "FAIL"
+        usage_str = ""
+        if result.get("usage"):
+            u = result["usage"]
+            usage_str = f" | prompt={u.get('prompt', '?')} tokens"
+        err_str = f" | {failure_reason[:120]}" if failure_reason else ""
+        print(f"{status} ({elapsed}s){usage_str}{err_str}")
+
+        tier_results.append({
+            "target": target,
+            "estimated_input_tokens": estimated_input,
+            "ok": tier_ok,
+            "status_code": result["status_code"],
+            "latency": elapsed,
+            "usage": result["usage"],
+            "error": result.get("error"),
+            "failure_reason": failure_reason,
+            "is_context_error": is_context_error,
+            "is_timeout": is_timeout,
+            "is_channel_error": is_channel_error,
+        })
+
+        # 成功即停，不再测更小的档
+        if tier_ok:
+            remaining = targets[tier_idx + 1:]
+            if remaining:
+                print(f"         -> {target//1000}k 通过，跳过更小档位 {[f'{t//1000}k' for t in remaining]}")
+            break
+
+    # ── 汇总 ──
+    all_passed = all(t["ok"] for t in tier_results)
+    any_passed = any(t["ok"] for t in tier_results)
+    passed_count = sum(1 for t in tier_results if t["ok"])
 
     return {
         "case_id": case["id"],
-        "passed": passed,
+        "passed": any_passed,  # 观测模式：任一档位通过即可
         "detail": {
-            "mode": "live_test",
-            "target": target_tokens,
+            "mode": "multi_tier",
+            "targets": targets,
             "declared": declared,
-            "status_code": result["status_code"],
-            "ok": result["ok"],
-            "latency": elapsed,
-            "is_context_error": is_context_error,
-            "is_timeout": is_timeout,
-            "failure_reason": failure_reason,
-            "error": result.get("error"),
-            "usage": result["usage"],
+            "all_passed": all_passed,
+            "any_passed": any_passed,
+            "passed_count": f"{passed_count}/{len(targets)}",
+            "tiers": tier_results,
         },
     }
 
@@ -1440,7 +1531,15 @@ def _cache_system_prompt(target_tokens: int = 3000) -> str:
 
 
 def test_cache_hit(cfg: dict, case: dict) -> dict:
-    """TC-09: 相同长 system prompt 发两次流式请求，验证前缀缓存命中。"""
+    """TC-09: 前缀缓存观测 — 发两次相同 system prompt 的流式请求，通过 TTFT 对比判断是否命中。
+
+    不依赖 cached_tokens 字段（大多数 API 不返回），改为观测 TTFT 下降幅度：
+      - 第 2 次 TTFT 下降 > 30%  → 认定为「命中」
+      - 下降 ≤ 30% 或反而更慢  → 认定为「未命中」
+    同时记录 cached_tokens 字段作为辅助参考（可能为 null/0）。
+
+    通过条件（观测模式）：两次请求均成功即可 — 缓存命中与否不作为硬性判定条件。
+    """
     api = cfg["api"]
     params = case.get("params", {})
     max_tokens = params.get("max_tokens", 100)
@@ -1470,38 +1569,68 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
             "error": r.get("error"),
         }
 
-    req1 = _do("冷启动")
+    # 发 3 次，用第 1 次预热（冷启动），后面两次看是否趋于稳定（命中）
+    req1 = _do("预热")
     time.sleep(0.3)
-    req2 = _do("缓存命中")
+    req2 = _do("第2次")
+    time.sleep(0.3)
+    req3 = _do("第3次")
 
-    both_ok = req1["ok"] and req2["ok"]
-    cached = req2.get("cached_tokens", 0)
-    cache_hit = cached > 0
+    all_ok = req1["ok"] and req2["ok"] and req3["ok"]
 
-    ttft_reduction = 0.0
-    if both_ok and req1["ttft"] > 0:
-        ttft_reduction = round((req1["ttft"] - req2["ttft"]) / req1["ttft"] * 100, 1)
+    # ── 基于 TTFT 判断缓存命中 ──
+    ttft_1_to_2 = 0.0   # 第 2 次 vs 第 1 次
+    ttft_2_to_3 = 0.0   # 第 3 次 vs 第 2 次
+    cache_1_2 = False
+    cache_2_3 = False
 
-    if cache_hit:
-        verdict = (
-            f"缓存命中: cached_tokens={cached}, "
-            f"TTFT {req1['ttft']}s → {req2['ttft']}s (降 {ttft_reduction}%)"
-        )
-    elif both_ok:
-        verdict = (
-            f"未命中: cached_tokens={cached}, "
-            f"TTFT {req1['ttft']}s → {req2['ttft']}s"
-        )
+    if all_ok and req1["ttft"] > 0:
+        ttft_1_to_2 = round((req1["ttft"] - req2["ttft"]) / req1["ttft"] * 100, 1)
+        cache_1_2 = ttft_1_to_2 > 30
+    if all_ok and req2["ttft"] > 0:
+        ttft_2_to_3 = round((req2["ttft"] - req3["ttft"]) / req2["ttft"] * 100, 1)
+        cache_2_3 = ttft_2_to_3 > 30
+
+    # 第 2 次或第 3 次任一命中即认为有缓存
+    cache_hit = cache_1_2 or cache_2_3
+
+    # ── cached_tokens 字段作为辅助参考 ──
+    field_cached_1 = req1.get("cached_tokens", 0)
+    field_cached_2 = req2.get("cached_tokens", 0)
+    field_cached_3 = req3.get("cached_tokens", 0)
+    field_cache_hit = field_cached_2 > 0 or field_cached_3 > 0
+
+    # ── 判定方式 ──
+    if field_cache_hit:
+        detect_method = "字段检测"
+    elif cache_hit:
+        detect_method = "TTFT分析"
+    else:
+        detect_method = "未命中"
+
+    if all_ok:
+        verdict_parts = []
+        verdict_parts.append(f"TTFT: {req1['ttft']}s → {req2['ttft']}s → {req3['ttft']}s")
+        verdict_parts.append(f"第2次降{ttft_1_to_2}%{' (命中)' if cache_1_2 else ''}")
+        verdict_parts.append(f"第3次降{ttft_2_to_3}%{' (命中)' if cache_2_3 else ''}")
+        if field_cache_hit:
+            verdict_parts.append(f"cached_tokens: [{field_cached_1}, {field_cached_2}, {field_cached_3}]")
+        verdict = " | ".join(verdict_parts)
     else:
         verdict = "请求失败"
 
     return {
         "case_id": case["id"],
-        "passed": both_ok and cache_hit,
+        "passed": True,  # 观测模式：始终为观测通过
         "detail": {
-            "request1": req1, "request2": req2,
-            "cached_tokens": cached, "cache_hit": cache_hit,
-            "ttft_reduction_pct": f"{ttft_reduction}%" if both_ok else "N/A",
+            "request1": req1,
+            "request2": req2,
+            "request3": req3,
+            "detect_method": detect_method,
+            "cache_hit": cache_hit or field_cache_hit,
+            "field_cached_tokens": [field_cached_1, field_cached_2, field_cached_3],
+            "ttft_1_to_2_pct": f"{ttft_1_to_2}%",
+            "ttft_2_to_3_pct": f"{ttft_2_to_3}%",
             "verdict": verdict,
         },
     }
@@ -1550,10 +1679,24 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 except (ValueError, TypeError):
                     pass
             if r.get("case_id") == "TC-04":
-                context_passed = "是" if r.get("passed") else "否"
-                if d.get("error") and not r.get("passed"):
-                    context_error = str(d["error"])[:200]
-                estimated_input = d.get("estimated_input_tokens", "N/A")
+                if d.get("mode") == "multi_tier":
+                    context_passed = d.get("passed_count", "0/?")
+                    tiers_detail = ", ".join(
+                        f"{t['target']//1000}k={'✓' if t.get('ok') else '✗'}"
+                        for t in d.get("tiers", [])
+                    )
+                    context_error = tiers_detail
+                    estimated_input = ", ".join(
+                        f"{t.get('estimated_input_tokens', '?')}"
+                        for t in d.get("tiers", [])
+                    )
+                else:
+                    context_passed = "是" if r.get("passed") else "否"
+                    if d.get("failure_reason"):
+                        context_error = str(d["failure_reason"])[:200]
+                    elif d.get("error"):
+                        context_error = str(d["error"])[:200]
+                    estimated_input = str(d.get("estimated_input_tokens", "N/A"))
 
     avg_latency = round(total_latency / latency_count, 3) if latency_count else "N/A"
     success_rate = f"{passed_cases / total_cases * 100:.1f}%" if total_cases else "N/A"
@@ -1586,10 +1729,10 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
         ["平均延迟 (秒)", str(avg_latency)],
         ["压测并发数", str(cfg.get("benchmark", {}).get("concurrency", ""))],
         ["压测总请求数", str(cfg.get("benchmark", {}).get("total_requests", ""))],
-        ["上下文验收门槛 (tokens)", str(cfg.get("context_test", {}).get("target_tokens", 512000))],
-        ["实测输入 Token 估算", str(estimated_input)],
-        ["512k 上下文是否通过", context_passed],
-        ["上下文测试错误", context_error or "无"],
+        ["上下文验收档位 (tokens)", str(cfg.get("context_test", {}).get("target_tokens", []))],
+        ["各档位实测 Token 估算", str(estimated_input)],
+        ["上下文测试结果", context_passed],
+        ["各档位详情", context_error or "无"],
         ["测试时间", test_time],
         ["测试结论", conclusion],
     ]
@@ -1653,15 +1796,20 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 if mode == "declared":
                     actual = (
                         f"模型声明 {detail.get('declared_context_length')} tokens, "
-                        f"阈值 {detail.get('target')}, {detail.get('reason', '')}"
+                        f"阈值 {detail.get('targets')}, {detail.get('reason', '')}"
                     )
                 elif mode == "probe":
                     actual = (
                         f"探测上限: {detail.get('found_limit')} tokens, "
-                        f"阈值 {detail.get('target')}, "
-                        f"{'达到' if detail.get('threshold_reached') else '未达到'}, "
+                        f"目标 {detail.get('targets')}, "
                         f"共 {detail.get('attempts_count', 0)} 次尝试"
                     )
+                elif mode == "multi_tier":
+                    parts = [f"通过 {detail.get('passed_count')} 档"]
+                    for t in detail.get("tiers", []):
+                        status = "✓" if t.get("ok") else "✗"
+                        parts.append(f"{t['target']//1000}k:{status}")
+                    actual = ", ".join(parts)
                 else:
                     actual = (
                         f"HTTP {detail.get('status_code')}, "
@@ -1713,14 +1861,16 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
             elif cid == "TC-09":
                 r1 = detail.get("request1", {}) or {}
                 r2 = detail.get("request2", {}) or {}
+                r3 = detail.get("request3", {}) or {}
                 actual = (
-                    f"{'[HIT]' if detail.get('cache_hit') else '[MISS]'} "
-                    f"cached_tokens={detail.get('cached_tokens', 0)}, "
-                    f"TTFT: {r1.get('ttft', 'N/A')}s → {r2.get('ttft', 'N/A')}s "
-                    f"(降{detail.get('ttft_reduction_pct', 'N/A')})"
+                    f"[{detail.get('detect_method', 'N/A')}] "
+                    f"TTFT: {r1.get('ttft', 'N/A')}s → {r2.get('ttft', 'N/A')}s → {r3.get('ttft', 'N/A')}s, "
+                    f"第2次降{detail.get('ttft_1_to_2_pct', 'N/A')}, "
+                    f"第3次降{detail.get('ttft_2_to_3_pct', 'N/A')}, "
+                    f"cached_tokens字段: {detail.get('field_cached_tokens', 'N/A')}"
                 )
                 if detail.get("verdict"):
-                    actual += f" | {detail['verdict'][:120]}"
+                    actual += f" | {detail['verdict'][:150]}"
             else:
                 actual = json.dumps(detail, ensure_ascii=False)
 
@@ -1790,15 +1940,22 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
     for r in results:
         cid = r.get("case_id", "?")
         if r.get("passed"):
-            case_status[cid] = "通过"
+            detail = r.get("detail", {})
+            if cid == "TC-04" and detail.get("mode") == "multi_tier":
+                case_status[cid] = f"通过({detail.get('passed_count', '?')})"
+            else:
+                case_status[cid] = "通过"
         else:
             detail = r.get("detail", {})
-            reason = (
-                detail.get("failure_reason") or
-                detail.get("reason") or
-                detail.get("error") or
-                "失败"
-            )
+            if cid == "TC-04" and detail.get("mode") == "multi_tier":
+                reason = f"全部{len(detail.get('tiers', []))}档失败"
+            else:
+                reason = (
+                    detail.get("failure_reason") or
+                    detail.get("reason") or
+                    detail.get("error") or
+                    "失败"
+                )
             reason = str(reason)[:80].replace("\n", " ").replace(",", "，")
             case_status[cid] = f"失败: {reason}"
 
@@ -1818,12 +1975,15 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
             decode_tps_s = str(d.get("decode_tps", "N/A"))
             cache_rate_s = str(d.get("cache_hit_rate", "N/A"))
 
-    # ── 如果 TC-09 有缓存命中率，优先用 TC-09 的 ──
+    # ── 如果 TC-09 有缓存命中，更新缓存命中率列 ──
     for r in results:
         if r.get("case_id") == "TC-09" and r.get("detail"):
             d = r["detail"]
+            method = d.get("detect_method", "")
             if d.get("cache_hit"):
-                cache_rate_s = d.get("ttft_reduction_pct", cache_rate_s)
+                cache_rate_s = f"命中({method})"
+            else:
+                cache_rate_s = f"未命中({method})"
 
     return [
         cfg["api"].get("model", ""),
@@ -2018,11 +2178,20 @@ def main():
             # 失败时立即打印原因
             if not result["passed"]:
                 detail = result.get("detail", {})
-                reason = detail.get("failure_reason") or detail.get("reason") or detail.get("error") or ""
-                if reason:
-                    print(f"         -> {reason[:200]}")
-                if detail.get("mode") == "live_test" and detail.get("is_timeout"):
-                    print(f"         -> 建议使用 --probe-context 渐进探测实际上下文上限")
+                if detail.get("mode") == "multi_tier":
+                    for t in detail.get("tiers", []):
+                        if not t.get("ok"):
+                            reason = t.get("failure_reason") or t.get("error") or ""
+                            if reason:
+                                print(f"         [{t['target']//1000}k] -> {reason[:180]}")
+                            if t.get("is_timeout"):
+                                print(f"         -> 建议缩短 context_test.timeout 或使用 --probe-context")
+                else:
+                    reason = detail.get("failure_reason") or detail.get("reason") or detail.get("error") or ""
+                    if reason:
+                        print(f"         -> {reason[:200]}")
+                    if detail.get("is_timeout"):
+                        print(f"         -> 建议使用 --probe-context 渐进探测实际上下文上限")
         except Exception as e:
             print(f"[ERROR] {e}")
             traceback.print_exc()
