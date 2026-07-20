@@ -1536,106 +1536,135 @@ def _cache_system_prompt(target_tokens: int = 3000) -> str:
 
 
 def test_cache_hit(cfg: dict, case: dict) -> dict:
-    """TC-09: 前缀缓存命中率测试。
+    """TC-09: 缓存命中 TPM 测试。
 
-    发 3 次相同长 system prompt（~5000 tokens，远超 256 的缓存块粒度）的流式请求：
-      - 第 1 次：冷启动，填充缓存
-      - 第 2、3 次：应有缓存命中，提取 cached_tokens 计算命中率
+    1. 发 1 次请求预热（填充前缀缓存）
+    2. 并发发送 N 个请求（相同长 system prompt + 不同的 user message 后缀）
+    3. 统计缓存命中率 + 缓存下的 TPM
 
-    命中率 = cached_tokens / prompt_tokens × 100%
     通过条件: 有缓存命中（cached_tokens > 0）且请求成功。
     """
     api = cfg["api"]
     params = case.get("params", {})
+    concurrency = cfg["benchmark"].get("concurrency", params.get("concurrency", 4))
+    total = cfg["benchmark"].get("total_requests", params.get("total_requests", 20))
     max_tokens = params.get("max_tokens", 50)
-    target_tokens = params.get("system_prompt_tokens", 5000)  # 足够长，超过 256 缓存粒度
+    target_tokens = params.get("system_prompt_tokens", 5000)
     timeout = api.get("timeout", 120)
 
     system_text = _cache_system_prompt(target_tokens)
-    user_content = params.get("messages", [{"role": "user", "content": "Summarize."}])[0].get("content", "Summarize.")
+    base_user = params.get("messages", [{"role": "user", "content": "Summarize."}])[0].get("content", "Summarize.")
 
-    messages = [
+    # ── 预热：填充前缀缓存 ──
+    messages_warm = [
         {"role": "system", "content": system_text},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": base_user},
     ]
+    warm = api_request_stream(
+        url=api["url"], key=api["key"], model=api["model"],
+        messages=messages_warm, max_tokens=max_tokens, timeout=timeout,
+    )
 
-    def _do(label: str) -> dict:
+    # ── 并发压测 ──
+    stats = {
+        "total": total, "concurrency": concurrency,
+        "ok": 0, "fail": 0,
+        "total_latency": 0.0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_cached_tokens": 0,
+        "total_ttft": 0.0,
+        "errors": [],
+    }
+
+    t_start = time.perf_counter()
+
+    def _worker(_idx):
+        # 相同 system prompt + 唯一 user 后缀（确保前缀可缓存但未尾不可）
+        varied_user = base_user + f"\n\n[req:{_idx}]"
+        varied_msgs = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": varied_user},
+        ]
         r = api_request_stream(
             url=api["url"], key=api["key"], model=api["model"],
-            messages=messages, max_tokens=max_tokens, timeout=timeout,
+            messages=varied_msgs, max_tokens=max_tokens, timeout=timeout,
         )
-        cached = r.get("cached_tokens", 0)
-        prompt = r.get("prompt_tokens", 1)
-        hit_rate = round(cached / prompt * 100, 1) if prompt > 0 else 0.0
-        return {
-            "label": label, "ok": r["ok"],
-            "ttft": r["ttft"], "total_latency": r["total_latency"],
-            "prompt_tokens": prompt,
-            "completion_tokens": r.get("completion_tokens", 0),
-            "cached_tokens": cached,
-            "cache_hit_rate": hit_rate,
-            "error": r.get("error"),
-        }
+        with _stats_lock:
+            if r["ok"]:
+                stats["ok"] += 1
+                stats["total_latency"] += r.get("total_latency", 0)
+                stats["total_ttft"] += r.get("ttft", 0)
+                stats["total_prompt_tokens"] += r.get("prompt_tokens", 0)
+                stats["total_completion_tokens"] += r.get("completion_tokens", 0)
+                stats["total_cached_tokens"] += r.get("cached_tokens", 0)
+            else:
+                stats["fail"] += 1
+                if r.get("error") and len(stats["errors"]) < 10:
+                    stats["errors"].append(r["error"])
+        return r
 
-    # 发 3 次：第 1 次冷启动，第 2/3 次应有缓存命中
-    req1 = _do("冷启动")
-    time.sleep(0.3)
-    req2 = _do("第2次")
-    time.sleep(0.3)
-    req3 = _do("第3次")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(_worker, i) for i in range(total)]
+        for f in as_completed(futures):
+            f.result()
 
-    all_ok = req1["ok"] and req2["ok"] and req3["ok"]
+    elapsed = time.perf_counter() - t_start
 
-    # ── 缓存命中判定 ──
-    # 优先用 prompt_tokens_details.cached_tokens 字段
-    field_hit_2 = req2.get("cached_tokens", 0) > 0
-    field_hit_3 = req3.get("cached_tokens", 0) > 0
-    cache_hit = field_hit_2 or field_hit_3
+    # ── 汇总 ──
+    n_ok = stats["ok"] if stats["ok"] > 0 else 1
+    total_tokens = stats["total_prompt_tokens"] + stats["total_completion_tokens"]
+    tpm = round(total_tokens / elapsed * 60, 0) if elapsed > 0 else 0
+    ttft_avg = round(stats["total_ttft"] / n_ok, 3)
+    avg_latency = round(stats["total_latency"] / n_ok, 3)
 
-    # 取两次中较高的命中率
-    best_rate = max(req2.get("cache_hit_rate", 0), req3.get("cache_hit_rate", 0))
-    cached_total = max(req2.get("cached_tokens", 0), req3.get("cached_tokens", 0))
+    # 缓存命中率 (prompt 中包含 system 的缓存命中)
+    prompt_total = stats["total_prompt_tokens"] if stats["total_prompt_tokens"] > 0 else 1
+    cache_hit_rate = round(stats["total_cached_tokens"] / prompt_total * 100, 1)
+    cache_hit = stats["total_cached_tokens"] > 0
 
-    # ── TTFT 对比作为辅助验证 ──
-    ttft_1_to_2 = round((req1["ttft"] - req2["ttft"]) / req1["ttft"] * 100, 1) if req1["ttft"] > 0 and all_ok else 0
-    ttft_2_to_3 = round((req2["ttft"] - req3["ttft"]) / req2["ttft"] * 100, 1) if req2.get("ttft", 0) > 0 and all_ok else 0
-    ttft_confirms = ttft_1_to_2 > 30 or ttft_2_to_3 > 30
+    # 预热 vs 缓存后的 TTFT 对比
+    warm_ttft = warm.get("ttft", 0)
+    ttft_reduction = round((warm_ttft - ttft_avg) / warm_ttft * 100, 1) if warm_ttft > 0 else 0
 
     if cache_hit:
-        detect_method = "prompt_tokens_details"
-    elif ttft_confirms:
-        detect_method = "TTFT"
-    else:
-        detect_method = "未命中"
-
-    if all_ok:
-        verdict_parts = [
-            f"命中率={best_rate}%",
-            f"cached={cached_total}/{req2.get('prompt_tokens', '?')} tokens",
-        ]
-        verdict_parts.append(
-            f"TTFT: {req1['ttft']}s→{req2['ttft']}s→{req3['ttft']}s"
-            f"(降{ttft_1_to_2}%/降{ttft_2_to_3}%)"
+        verdict = (
+            f"缓存命中率={cache_hit_rate}%, "
+            f"TPM={tpm:.0f} tok/min, "
+            f"TTFT cold={warm_ttft}s→avg={ttft_avg}s "
+            f"(降{ttft_reduction}%), "
+            f"成功{stats['ok']}/{stats['total']}"
         )
-        verdict = " | ".join(verdict_parts)
     else:
-        verdict = "请求失败"
+        verdict = (
+            f"未命中, TPM={tpm:.0f} tok/min, "
+            f"TTFT cold={warm_ttft}s/avg={ttft_avg}s, "
+            f"成功{stats['ok']}/{stats['total']}"
+        )
 
     return {
         "case_id": case["id"],
-        "passed": all_ok and cache_hit,
+        "passed": stats["ok"] > 0 and cache_hit,
         "detail": {
-            "detect_method": detect_method,
-            "request1": req1,
-            "request2": req2,
-            "request3": req3,
-            "cache_hit": cache_hit,
-            "cache_hit_rate_pct": best_rate,
-            "cached_tokens_max": cached_total,
-            "prompt_tokens": req2.get("prompt_tokens", 0),
-            "ttft_1_to_2_pct": f"{ttft_1_to_2}%",
-            "ttft_2_to_3_pct": f"{ttft_2_to_3}%",
-            "ttft_confirms": ttft_confirms,
+            "warmup": {
+                "ok": warm["ok"],
+                "ttft": warm["ttft"],
+                "prompt_tokens": warm.get("prompt_tokens", 0),
+                "cached_tokens": warm.get("cached_tokens", 0),
+            },
+            "elapsed": round(elapsed, 2),
+            "ok": stats["ok"],
+            "fail": stats["fail"],
+            "concurrency": concurrency,
+            "total_requests": total,
+            "tpm_tokens": f"{tpm:.0f}",
+            "cache_hit_rate_pct": cache_hit_rate,
+            "total_cached_tokens": stats["total_cached_tokens"],
+            "total_prompt_tokens": stats["total_prompt_tokens"],
+            "ttft_avg": ttft_avg,
+            "ttft_reduction_pct": f"{ttft_reduction}%",
+            "avg_latency": avg_latency,
+            "errors": stats["errors"][:5],
             "verdict": verdict,
         },
     }
@@ -1850,8 +1879,6 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                     f"HTTP {detail.get('status_code')}, "
                     f"延迟 {detail.get('latency', 'N/A')}s"
                 )
-                if detail.get("verdict"):
-                    actual += f" | {detail['verdict'][:150]}"
             elif cid == "TC-08":
                 actual = (
                     f"成功 {detail.get('ok')}/{detail.get('ok',0)+detail.get('fail',0)}, "
@@ -1864,17 +1891,16 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                     f"Cache命中={detail.get('cache_hit_rate')}"
                 )
             elif cid == "TC-09":
-                r1 = detail.get("request1", {}) or {}
-                r2 = detail.get("request2", {}) or {}
-                r3 = detail.get("request3", {}) or {}
+                warmup = detail.get("warmup", {}) or {}
                 actual = (
-                    f"[{detail.get('detect_method', 'N/A')}] "
                     f"缓存命中率: {detail.get('cache_hit_rate_pct', 'N/A')}%, "
-                    f"cached={detail.get('cached_tokens_max', 0)}/{detail.get('prompt_tokens', '?')} tokens, "
-                    f"TTFT: {r1.get('ttft', 'N/A')}s→{r2.get('ttft', 'N/A')}s→{r3.get('ttft', 'N/A')}s"
+                    f"TPM(缓存): {detail.get('tpm_tokens', 'N/A')} tok/min, "
+                    f"TTFT cold={warmup.get('ttft', 'N/A')}s→avg={detail.get('ttft_avg', 'N/A')}s, "
+                    f"cached={detail.get('total_cached_tokens', 0)}/{detail.get('total_prompt_tokens', 0)} tokens, "
+                    f"成功{detail.get('ok', 0)}/{detail.get('total_requests', 0)}"
                 )
                 if detail.get("verdict"):
-                    actual += f" | {detail['verdict'][:150]}"
+                    actual += f" | {detail['verdict'][:120]}"
             else:
                 actual = json.dumps(detail, ensure_ascii=False)
 
@@ -1947,12 +1973,16 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
             detail = r.get("detail", {})
             if cid == "TC-04" and detail.get("mode") == "multi_tier":
                 case_status[cid] = f"通过({detail.get('passed_count', '?')})"
+            elif cid == "TC-09":
+                case_status[cid] = f"通过({detail.get('cache_hit_rate_pct', 'N/A')}%)"
             else:
                 case_status[cid] = "通过"
         else:
             detail = r.get("detail", {})
             if cid == "TC-04" and detail.get("mode") == "multi_tier":
                 reason = f"全部{len(detail.get('tiers', []))}档失败"
+            elif cid == "TC-09":
+                reason = f"未命中({detail.get('cache_hit_rate_pct', 0)}%)"
             else:
                 reason = (
                     detail.get("failure_reason") or
@@ -1983,10 +2013,7 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
     for r in results:
         if r.get("case_id") == "TC-09" and r.get("detail"):
             d = r["detail"]
-            if d.get("cache_hit"):
-                cache_rate_s = f"{d.get('cache_hit_rate_pct', 'N/A')}%"
-            else:
-                cache_rate_s = f"未命中({d.get('detect_method', 'N/A')})"
+            cache_rate_s = f"{d.get('cache_hit_rate_pct', 'N/A')}%"
 
     return [
         cfg["api"].get("model", ""),

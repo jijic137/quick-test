@@ -139,13 +139,15 @@
     },
     {
       "id": "TC-09",
-      "name": "前缀缓存命中",
-      "type": "功能",
-      "input": "~3k token system prompt 发两次流式请求，第二次应有前缀缓存命中",
-      "expected": "第 2/3 次请求 prompt_tokens_details.cached_tokens > 0，命中率 > 50%",
+      "name": "缓存命中 TPM",
+      "type": "性能",
+      "input": "预热后并发 {{concurrency}} 请求，相同 system prompt（~5k tokens）+ 不同 user 后缀",
+      "expected": "cached_tokens > 0，命中率 > 50%，缓存下 TPM 有效",
       "method": "cache_hit",
       "params": {
-        "max_tokens": 100,
+        "concurrency": 10,
+        "total_requests": 30,
+        "max_tokens": 50,
         "system_prompt_tokens": 5000,
         "messages": [
           {"role": "user", "content": "Based on the context provided, summarize the key points in 3-5 bullet points. Keep each bullet under 15 words."}
