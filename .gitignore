@@ -1,5 +1,7 @@
 # 生成文件
 results/
+result_md/
+test_summary.csv
 
 # 敏感配置（含 API Key）
 test_config.json
@@ -8,5 +10,5 @@ test_config.json
 __pycache__/
 *.pyc
 
-#其他
+# 其他
 template.xlsx

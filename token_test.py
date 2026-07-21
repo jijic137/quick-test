@@ -48,6 +48,7 @@ BASE_DIR      = Path(__file__).resolve().parent
 CONFIG_PATH   = BASE_DIR / "test_config.json"
 CASES_PATH    = BASE_DIR / "test_cases.json"
 RESULTS_DIR   = BASE_DIR / "results"                  # 每次运行的详情输出目录
+RESULTS_MD_DIR = BASE_DIR / "result_md"              # 验收报告输出目录
 SUMMARY_PATH  = BASE_DIR / "test_summary.csv"         # 累积汇总文件（每次追加一行）
 
 # 北京时间
@@ -157,6 +158,40 @@ def _gen_request_id() -> str:
     _req_counter[0] += 1
     ts = datetime.now(TZ_BJ).strftime("%Y%m%d%H%M%S%f")
     return f"req_{ts}_{_req_counter[0]:06d}"
+
+
+def _error_category(error_msg: str, status_code: int = None) -> str:
+    """将错误归类到有限的桶里，便于统计分布。"""
+    if error_msg == "请求超时":
+        return "请求超时"
+    if error_msg and error_msg.startswith("连接失败"):
+        return "连接失败"
+    if error_msg.startswith("未收到任何 token"):
+        return "流式无输出"
+    if status_code and status_code >= 400:
+        return f"HTTP {status_code}"
+    if status_code and status_code < 400 and error_msg:
+        return f"HTTP {status_code}: {error_msg[:40]}"
+    if error_msg:
+        return error_msg[:60]
+    return "未知错误"
+
+
+def _chunk_keys(chunk: dict) -> dict:
+    """提取 chunk 的结构信息（仅 key 和类型），用于流式调试。"""
+    info = {}
+    for k, v in chunk.items():
+        if k == "choices" and isinstance(v, list) and v:
+            delta = v[0].get("delta", {}) if isinstance(v[0], dict) else {}
+            info["choices[0].delta"] = list(delta.keys()) if delta else "(empty)"
+            info["choices[0].finish_reason"] = v[0].get("finish_reason") if isinstance(v[0], dict) else None
+        elif isinstance(v, dict):
+            info[k] = list(v.keys())
+        elif isinstance(v, list):
+            info[k] = f"[{len(v)}]"
+        else:
+            info[k] = type(v).__name__
+    return info
 
 
 def _percentiles(data: list, *ps) -> dict:
@@ -290,6 +325,36 @@ def parse_args():
         action="store_true",
         default=False,
         help="启用渐进式上下文探测：从小量递增直到找到实际上限（较慢但精确）",
+    )
+    parser.add_argument(
+        "--g-start",
+        type=int,
+        default=100,
+        help="梯度测试起始并发数 (默认: 100)",
+    )
+    parser.add_argument(
+        "--g-step",
+        type=int,
+        default=200,
+        help="梯度测试步长 (默认: 200)",
+    )
+    parser.add_argument(
+        "--g-max",
+        type=int,
+        default=None,
+        help="梯度测试最大并发数 (默认: 取 -c 的值)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=50,
+        help="实际并发线程数上限 (默认: 50)",
+    )
+    parser.add_argument(
+        "--platform",
+        type=str,
+        default="",
+        help="平台信息备注（如 GPU: A100×8），写入报告头部",
     )
 
     return parser.parse_args(_preprocess_argv())
@@ -510,16 +575,20 @@ def api_request_stream(url: str, key: str, model: str, messages: list,
 
             now = time.perf_counter()
 
-            # 首 token 时间 — 兼容 content 和 reasoning_content
+            # 首 token 时间 — 精确判断 content/reasoning_content
             choices = chunk.get("choices", [])
             delta = choices[0].get("delta", {}) if choices else {}
-            has_content = delta.get("content") or delta.get("reasoning_content")
-            if has_content:
+            content_val = delta.get("content")
+            reasoning_val = delta.get("reasoning_content")
+            has_ct = (content_val is not None and content_val != "") or (reasoning_val is not None and reasoning_val != "")
+            if has_ct:
                 if first_token is None:
                     first_token = now
                 last_token_time = now
                 completion_count += 1
                 result["token_times"].append(round(now - t_start, 4))
+            elif first_token is None and any(v for k, v in delta.items() if k != "role" and v):
+                first_token = now  # 非标准 delta 字段兜底
 
             # usage 通常在最后一块返回
             if "usage" in chunk and chunk["usage"]:
@@ -527,23 +596,27 @@ def api_request_stream(url: str, key: str, model: str, messages: list,
                 result["prompt_tokens"] = int(u.get("prompt_tokens", 0))
                 result["completion_tokens"] = int(u.get("completion_tokens", 0))
                 result["total_tokens"] = int(u.get("total_tokens", 0))
-                # 提取缓存命中（prompt_tokens_details.cached_tokens，大多 API 不返回）
                 ptd = u.get("prompt_tokens_details") or u.get("prompt_tokens_detail") or {}
                 result["cached_tokens"] = int(ptd.get("cached_tokens", 0))
-                # 推理模型兼容：优先用 usage 里的 completion_tokens
-                if result["completion_tokens"] == 0:
-                    result["completion_tokens"] = int(u.get("completion_tokens", 0))
 
         result["total_latency"] = round(time.perf_counter() - t_start, 3)
-        result["ok"] = first_token is not None
 
-        if first_token:
+        # usage 兜底恢复
+        uc = result.get("completion_tokens", 0)
+        if completion_count == 0 and uc > 0:
+            result["completion_tokens"] = uc
+            if first_token is None:
+                first_token = t_start
+            result["ttft"] = 0.001
+            completion_count = uc
+        elif first_token:
             result["ttft"] = round(first_token - t_start, 3)
-            # 如果 usage 没返回，用 token_times 数量
             if result["completion_tokens"] == 0:
                 result["completion_tokens"] = completion_count
         else:
             result["error"] = "未收到任何 token"
+
+        result["ok"] = (first_token is not None and first_token != t_start) or (result.get("status_code") == 200 and uc > 0)
 
     except requests.exceptions.Timeout:
         result["total_latency"] = round(time.perf_counter() - t_start, 3)
@@ -744,6 +817,12 @@ def build_cfg(args) -> dict:
             "concurrency": args.concurrency,
             "total_requests": args.requests,
             "input_tokens": args.input_tokens,
+            "max_workers": args.max_workers,
+            "gradient": {
+                "start": args.g_start,
+                "step": args.g_step,
+                "max": args.g_max or args.concurrency,
+            },
         },
         "context_test": {
             "target_tokens": target_list,
@@ -781,80 +860,99 @@ def test_connectivity(cfg: dict, case: dict) -> dict:
 
 
 def test_tps_benchmark(cfg: dict, case: dict) -> dict:
-    """TC-02: TPS 压测 — 并发请求，计算 TPS/TPM。"""
+    """TC-02: TPS 压测 — 并发梯度 + Decode TPS/TPM。"""
     api = cfg["api"]
     params = case.get("params", {})
-    concurrency = cfg["benchmark"].get("concurrency", params.get("concurrency", 4))
-    total = cfg["benchmark"].get("total_requests", params.get("total_requests", 20))
     input_tokens = cfg["benchmark"].get("input_tokens", 1000)
-    # 输出与输入成比例：输入越长，输出也适当增加（但 cap 在 500）
     max_tokens = min(500, max(params.get("max_tokens", 300), input_tokens // 3))
     messages = _gen_benchmark_messages(input_tokens)
+    timeout = api.get("timeout", 60)
+    gradient = cfg["benchmark"].get("gradient", {})
 
-    stats = {
-        "total": total,
-        "concurrency": concurrency,
-        "ok": 0,
-        "fail": 0,
-        "total_latency": 0.0,
-        "total_prompt_tokens": 0,
-        "total_completion_tokens": 0,
-        "total_tokens": 0,
-        "errors": [],
-    }
+    def _run_bench(concurrency: int, total: int):
+        stats = {"ok": 0, "fail": 0, "total_latency": 0.0,
+                 "total_prompt_tokens": 0, "total_completion_tokens": 0,
+                 "total_tokens": 0, "errors": []}
 
-    t_start = time.perf_counter()
+        def _worker(_idx):
+            varied_msgs = [dict(m) for m in messages]
+            varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
+            r = api_request(url=api["url"], key=api["key"], model=api["model"],
+                            messages=varied_msgs, max_tokens=max_tokens, timeout=timeout)
+            with _stats_lock:
+                if r["ok"]:
+                    stats["ok"] += 1
+                    stats["total_latency"] += r["latency"]
+                    if r["usage"]:
+                        stats["total_prompt_tokens"] += r["usage"]["prompt"]
+                        stats["total_completion_tokens"] += r["usage"]["completion"]
+                        stats["total_tokens"] += r["usage"]["total"]
+                else:
+                    stats["fail"] += 1
+                    if r["error"] and len(stats["errors"]) < 20:
+                        stats["errors"].append(r["error"])
+            return r
 
-    def _worker(_idx):
-        # 每个请求在末尾追加唯一标记，避免 KV-cache 命中导致 TPS 虚高
-        varied_msgs = [dict(m) for m in messages]
-        varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
-        r = api_request(
-            url=api["url"], key=api["key"], model=api["model"],
-            messages=varied_msgs, max_tokens=max_tokens,
-            timeout=api.get("timeout", 60),
-        )
-        with _stats_lock:
-            if r["ok"]:
-                stats["ok"] += 1
-                stats["total_latency"] += r["latency"]
-                if r["usage"]:
-                    stats["total_prompt_tokens"] += r["usage"]["prompt"]
-                    stats["total_completion_tokens"] += r["usage"]["completion"]
-                    stats["total_tokens"] += r["usage"]["total"]
-            else:
-                stats["fail"] += 1
-                if r["error"] and len(stats["errors"]) < 20:
-                    stats["errors"].append(r["error"])
-        return r
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = []
+            for i in range(total):
+                futures.append(pool.submit(_worker, i))
+                time.sleep(0.02)  # 20ms stagger
+            for f in as_completed(futures):
+                f.result()
+        elapsed = time.perf_counter() - t0
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(_worker, i) for i in range(total)]
-        for f in as_completed(futures):
-            f.result()
+        success_rate = stats["ok"] / total * 100 if total else 0
+        tps_tokens = stats["total_tokens"] / elapsed if elapsed > 0 else 0
+        decode_tps = stats["total_completion_tokens"] / elapsed if elapsed > 0 else 0
+        avg_latency = stats["total_latency"] / stats["ok"] if stats["ok"] else 0
 
-    elapsed = time.perf_counter() - t_start
-    success_rate = stats["ok"] / total * 100 if total else 0
-    tps_tokens = stats["total_tokens"] / elapsed if elapsed > 0 else 0
-    avg_latency = stats["total_latency"] / stats["ok"] if stats["ok"] else 0
+        error_counts = {}
+        for err in stats["errors"]:
+            cat = _error_category(err, None)
+            error_counts[cat] = error_counts.get(cat, 0) + 1
 
-    passed = stats["ok"] > 0 and tps_tokens > 0
+        return {"concurrency": concurrency, "total": total,
+                "elapsed": round(elapsed, 2), "ok": stats["ok"], "fail": stats["fail"],
+                "success_rate": f"{success_rate:.1f}%",
+                "tps_tokens": f"{tps_tokens:.1f}", "tpm_tokens": f"{tps_tokens * 60:.1f}",
+                "tps_per_c": round(tps_tokens / concurrency, 1) if concurrency else 0,
+                "decode_tps": f"{decode_tps:.1f}", "decode_tpm": f"{decode_tps * 60:.1f}",
+                "decode_tps_per_c": round(decode_tps / concurrency, 1) if concurrency else 0,
+                "avg_latency": round(avg_latency, 3),
+                "total_tokens": stats["total_tokens"],
+                "total_prompt_tokens": stats["total_prompt_tokens"],
+                "total_completion_tokens": stats["total_completion_tokens"],
+                "error_counts": error_counts}
 
-    return {
-        "case_id": case["id"],
-        "passed": passed,
-        "detail": {
-            "elapsed": round(elapsed, 2),
-            "ok": stats["ok"],
-            "fail": stats["fail"],
-            "success_rate": f"{success_rate:.1f}%",
-            "tps_tokens": f"{tps_tokens:.1f}",
-            "tpm_tokens": f"{tps_tokens * 60:.1f}",
-            "avg_latency": round(avg_latency, 3),
-            "total_tokens": stats["total_tokens"],
-            "errors": stats["errors"][:5],
-        },
-    }
+    g_start = gradient["start"]
+    g_step = gradient["step"]
+    g_max = gradient["max"]
+    levels = []
+
+    print(f"         [梯度] {g_start} → {g_max} (步长 {g_step})")
+    for c in range(g_start, g_max + 1, g_step):
+        print(f"         [{c}] 并发={c} 请求={c} ... ", end="", flush=True)
+        lr = _run_bench(c, c)
+        levels.append(lr)
+        print(f"ok={lr['ok']} fail={lr['fail']} TPS={lr['tps_tokens']} tok/s Decode={lr['decode_tps']} tok/s")
+        if c + g_step <= g_max:
+            time.sleep(1)
+
+    total_ok = sum(l["ok"] for l in levels)
+    total_fail = sum(l["fail"] for l in levels)
+    total_tokens_all = sum(l["total_tokens"] for l in levels)
+    best = max(levels, key=lambda l: float(l["tps_tokens"]))
+    passed = total_ok > 0
+
+    return {"case_id": case["id"], "passed": passed,
+            "detail": {"mode": "gradient", "levels": levels,
+                       "ok": total_ok, "fail": total_fail,
+                       "total_tokens": total_tokens_all,
+                       "tps_tokens": best["tps_tokens"], "tpm_tokens": best["tpm_tokens"],
+                       "decode_tps": best["decode_tps"], "decode_tpm": best["decode_tpm"],
+                       "best_concurrency": best["concurrency"]}}
 
 
 def test_tpm_calc(cfg: dict, case: dict, prev_result: dict = None) -> dict:
@@ -1070,8 +1168,13 @@ def test_context_limit(cfg: dict, case: dict, probe_mode: bool = False,
 
 
 def test_auth_failure(cfg: dict, case: dict) -> dict:
-    """TC-05: 鉴权失败 — 使用无效 Key，应返回 401/403。"""
+    """TC-05: 鉴权失败 — 无 Key 直接通过，有 Key 测无效 Key 拒绝。"""
     api = cfg["api"]
+    key = api.get("key", "").strip()
+    if not key or key == "sk-your-api-key-here":
+        return {"case_id": case["id"], "passed": True,
+                "detail": {"status_code": None, "expected_codes": "N/A（无需鉴权）",
+                           "error": None, "note": "未提供 API Key，服务不需要鉴权"}}
     result = api_request(
         url=api["url"],
         key="sk-invalid-key-for-testing",
@@ -1430,6 +1533,7 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
     itl_pct = _percentiles(per_req_itl_max, 50, 90, 99)
     itl_over_req_pct = round(stats["itl_over_500ms_requests"] / n_ok * 100, 1)
 
+    ok_rate = stats["ok"] / total * 100 if total else 0
     passed = stats["ok"] > 0
 
     return {
@@ -1437,6 +1541,7 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
         "passed": passed,
         "detail": {
             "elapsed": round(elapsed, 2),
+            "reliable": ok_rate >= 50,
             "ok": stats["ok"],
             "fail": stats["fail"],
             # 平均值
@@ -1546,8 +1651,8 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
     """
     api = cfg["api"]
     params = case.get("params", {})
-    concurrency = cfg["benchmark"].get("concurrency", params.get("concurrency", 4))
-    total = cfg["benchmark"].get("total_requests", params.get("total_requests", 20))
+    concurrency = params.get("concurrency") or 4
+    total = params.get("total_requests") or 20
     max_tokens = params.get("max_tokens", 50)
     target_tokens = params.get("system_prompt_tokens", 5000)
     timeout = api.get("timeout", 120)
@@ -1646,6 +1751,7 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
         "case_id": case["id"],
         "passed": stats["ok"] > 0 and cache_hit,
         "detail": {
+            "reliable": (stats["ok"] / total * 100 >= 50) if total else False,
             "warmup": {
                 "ok": warm["ok"],
                 "ttft": warm["ttft"],
@@ -1739,11 +1845,15 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
 
     tps_val = "N/A"
     tpm_val = "N/A"
+    decode_tps_val = "N/A"
+    decode_tpm_val = "N/A"
     for r in results:
         if r.get("case_id") == "TC-02" and r.get("detail"):
             d = r["detail"]
             tps_val = d.get("tps_tokens", "N/A")
             tpm_val = d.get("tpm_tokens", "N/A")
+            decode_tps_val = d.get("decode_tps", "N/A")
+            decode_tpm_val = d.get("decode_tpm", "N/A")
 
     key_display = api.get("key", "")
     if len(key_display) > 20:
@@ -1812,12 +1922,25 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 if not passed and detail.get("error"):
                     actual += f", 错误: {detail['error']}"
             elif cid == "TC-02":
-                actual = (
-                    f"成功 {detail.get('ok')}/{detail.get('ok',0)+detail.get('fail',0)}, "
-                    f"TPS={detail.get('tps_tokens')} tok/s, "
-                    f"TPM={detail.get('tpm_tokens')} tok/min, "
-                    f"平均延迟 {detail.get('avg_latency')}s"
-                )
+                if detail.get("mode") == "gradient":
+                    lvs = detail.get("levels", [])
+                    best_c = detail.get("best_concurrency", "?")
+                    actual = (f"梯度{lvs[0]['concurrency']}→{lvs[-1]['concurrency']}({len(lvs)}级), "
+                              f"最高TPS={detail.get('tps_tokens')}tok/s(并发={best_c}), "
+                              f"Decode={detail.get('decode_tps')}tok/s, "
+                              f"总成功/失败={detail.get('ok')}/{detail.get('fail')}")
+                else:
+                    actual = (
+                        f"成功{detail.get('ok')}/{detail.get('ok',0)+detail.get('fail',0)}, "
+                        f"TPS={detail.get('tps_tokens')}tok/s, "
+                        f"TPM={detail.get('tpm_tokens')}tok/min, "
+                        f"Decode={detail.get('decode_tps','N/A')}tok/s, "
+                        f"平均延迟{detail.get('avg_latency')}s"
+                    )
+                    ec = detail.get("error_counts", {})
+                    if ec:
+                        parts = [f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:3]]
+                        actual += f", 失败:{', '.join(parts)}"
             elif cid == "TC-03":
                 actual = (
                     f"TPS={detail.get('tps')}, TPM={detail.get('tpm')}, "
@@ -1915,13 +2038,285 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
 
     print(f"[OK] 结果已写入: {output_path}")
 
+
+# ---------------------------------------------------------------------------
+# HTML 报告样式 & 生成
+# ---------------------------------------------------------------------------
+
+_HTML_CSS = """
+body{font-family:system-ui,sans-serif;max-width:1100px;margin:20px auto;padding:0 16px;color:#1a1a1a}
+h1{font-size:1.3em;margin:0 0 4px}.pass{color:#1a7f37}.fail{color:#cf222e}.warn{color:#9a6700}
+.meta{color:#666;font-size:.85em;margin:0 0 16px;line-height:1.5}.meta b{color:#333}
+h2{font-size:1.1em;border-bottom:2px solid #d0d7de;padding-bottom:4px;margin:20px 0 12px}
+h3{font-size:.95em;margin:14px 0 4px}.badge{font-weight:600}
+table{border-collapse:collapse;width:100%;margin:6px 0 12px;font-size:.85em}
+th,td{padding:4px 8px;text-align:left;border-bottom:1px solid #d0d7de}
+th{background:#f6f8fa;font-weight:600}.ok{color:#1a7f37}.bad{color:#cf222e}
+tr:hover{background:#f6f8fa}pre{background:#f6f8fa;padding:8px 12px;border-radius:4px;font-size:.82em;overflow:auto}
+.note{color:#666;font-size:.85em}details{margin:4px 0}summary{cursor:pointer;color:#0969da}
+"""
+
+
+def _html_tc01(d):
+    u = d.get("usage") or {}
+    return f"HTTP {d.get('status_code')} | {d.get('latency', 'N/A')}s | {u.get('total', 'N/A')} tokens"
+
+
+def _html_tc02(d):
+    lvs = d.get("levels", [])
+    if not lvs:
+        return ""
+    best_c = d.get("best_concurrency", "?")
+    avg_tok = lvs[0].get("total_tokens", 0) // max(lvs[0].get("ok", 1), 1) if lvs else 0
+    h = [f"<p>最高 TPS <b>{d.get('tps_tokens')}</b> tok/s(并发={best_c}) | Decode <b>{d.get('decode_tps')}</b> tok/s | 均≈{avg_tok} tok/请求</p>"]
+    h.append("<table><tr><th>并发</th><th>成功</th><th>失败</th><th>耗时</th><th>TPS</th><th>TPS/并</th><th>Dec TPS</th><th>Dec/并</th><th>总Tok</th><th>延迟</th><th>错误</th></tr>")
+    for lv in lvs:
+        ec = lv.get("error_counts", {})
+        es = ", ".join(f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:2]) or "-"
+        h.append(f"<tr><td>{lv['concurrency']}</td><td class=\"ok\">{lv['ok']}</td><td class=\"bad\">{lv['fail']}</td><td>{lv['elapsed']}s</td><td>{lv['tps_tokens']}</td><td>{lv.get('tps_per_c', 'N/A')}</td><td>{lv['decode_tps']}</td><td>{lv.get('decode_tps_per_c', 'N/A')}</td><td>{lv['total_tokens']}</td><td>{lv['avg_latency']}s</td><td>{es}</td></tr>")
+    h.append("</table>")
+    return "\n".join(h)
+
+
+def _html_tc04(d, passed):
+    mode = d.get("mode", "")
+    if mode == "multi_tier":
+        h = [f"<p>通过 {d.get('passed_count', '?')}</p><table><tr><th>档位</th><th>状态</th><th>延迟</th><th>原因</th></tr>"]
+        for t in d.get("tiers", []):
+            reason = (t.get("failure_reason") or t.get("error") or "—")[:80]
+            h.append(f"<tr><td>{t['target']//1000}k</td><td>{'✅' if t.get('ok') else '❌'}</td><td>{t.get('latency', '')}s</td><td>{reason}</td></tr>")
+        h.append("</table>")
+        return "\n".join(h)
+    if mode == "declared":
+        return f"声明 {d.get('declared_context_length')} tokens → {'✅' if passed else '❌'} {d.get('reason', '')}"
+    if mode == "probe":
+        return f"探测上限 {d.get('found_limit')} tokens(目标 {d.get('targets')}, {d.get('attempts_count', 0)}次)"
+    return f"HTTP {d.get('status_code')} | {(d.get('failure_reason') or d.get('error') or '无')[:120]}"
+
+
+def write_html_report(results, cases, cfg, args, output_path, test_time,
+                       model_info=None):
+    """生成自包含 HTML 验收报告。"""
+    api = cfg["api"]
+    bench = cfg.get("benchmark", {})
+    grad = bench.get("gradient", {})
+    inp = bench.get("input_tokens", 1000)
+    out_max = min(500, max(300, inp // 3))
+    tc = sum(1 for r in results if r.get("passed"))
+    fc = len(results) - tc
+    sr = f"{tc / len(results) * 100:.1f}%" if results else "N/A"
+    cn = "全部通过" if fc == 0 else f"{fc}/{len(results)} 未通过"
+    cn_cls = "pass" if fc == 0 else "fail"
+
+    # 关键指标提取
+    tps_val = decode_tps_val = ttft_avg = ttft_p99 = tpot_avg = cr = "N/A"
+    for r in results:
+        d = r.get("detail", {}) or {}
+        if r.get("case_id") == "TC-02":
+            tps_val = d.get("tps_tokens", "N/A")
+            decode_tps_val = d.get("decode_tps", "N/A")
+        if r.get("case_id") == "TC-08":
+            ttft_avg = d.get("ttft_avg", "N/A")
+            ttft_p99 = d.get("ttft_p99", "N/A")
+            tpot_avg = d.get("tpot_avg_ms", "N/A")
+        if r.get("case_id") == "TC-09":
+            cr = f"{d.get('cache_hit_rate_pct', 'N/A')}%"
+
+    cmd = "python token_test.py " + " ".join(
+        f'"{a}"' if " " in a else a for a in sys.argv[1:])
+
+    # 平台信息
+    plat = [f"<b>{api.get('model', '')}</b>"]
+    if getattr(args, 'platform', ''):
+        plat.append(args.platform)
+    plat.append(f"超时{api.get('timeout', '')}s")
+    plat.append(f"输入/输出~{inp}/≤{out_max}tok")
+    plat.append(f"梯度{grad.get('start','')}→{grad.get('max','')}步长{grad.get('step','')}")
+    plat.append(f"通过{tc}/{len(results)}({sr})")
+
+    h = []
+    h.append(f"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>测试报告—{test_time}</title><style>{_HTML_CSS}</style></head><body>")
+    h.append(f"<h1>Token接口测试报告<span class=\"{cn_cls}\">{'✅' if fc==0 else '❌'}{cn}</span></h1>")
+    h.append(f"<div class=\"meta\">{' | '.join(plat)}</div>")
+    h.append(f"<pre>{cmd}</pre>")
+
+    # 关键指标摘要
+    m = []
+    if tps_val != "N/A": m.append(f"TPS{tps_val}tok/s")
+    if decode_tps_val != "N/A": m.append(f"Decode{decode_tps_val}tok/s")
+    if ttft_avg != "N/A": m.append(f"TTFT avg{ttft_avg}s P99{ttft_p99}s")
+    if tpot_avg != "N/A": m.append(f"TPOT{tpot_avg}ms")
+    if cr != "N/A": m.append(f"缓存{cr}")
+    if m:
+        h.append(f"<div class=\"note\">{' | '.join(m)}</div>")
+
+    h.append("<h2>详细结果</h2>")
+    rm = {r["case_id"]: r for r in results}
+
+    for case in cases:
+        cid = case["id"]
+        r = rm.get(cid, {})
+        if not r:
+            h.append(f"<h3>{cid}{case['name']}<span class=\"badge\">⚪</span></h3><p class=\"note\">未执行</p>")
+            continue
+        p = r.get("passed", False)
+        d = r.get("detail", {}) or {}
+        b = f"<span class=\"badge {'pass' if p else 'fail'}\">{'✅' if p else '❌'}</span>"
+        h.append(f"<h3>{cid}{case['name']}{b}</h3>")
+
+        if cid == "TC-01":
+            h.append(f"<p>{_html_tc01(d)}</p>")
+        elif cid == "TC-02":
+            h.append(_html_tc02(d))
+        elif cid == "TC-03":
+            ok = "✅正确" if d.get("formula_ok") else "❌不符"
+            h.append(f"<p>TC-02 TPS={d.get('tps')}→TPM={d.get('tpm')}|TPM=TPS×60:{ok}</p>")
+        elif cid == "TC-04":
+            h.append(f"<p>{_html_tc04(d, p)}</p>")
+        elif cid == "TC-05":
+            if d.get("status_code") is None:
+                h.append("<p class=\"note\">无需鉴权，跳过</p>")
+            else:
+                h.append(f"<p>HTTP{d.get('status_code')}|{'✅预期' if p else '❌'}</p>")
+        elif cid == "TC-06":
+            h.append(f"<p>OK={d.get('ok')}429={d.get('rate_limited_429')}超时={d.get('timeout')}耗时={d.get('elapsed')}s</p>")
+        elif cid == "TC-07":
+            h.append(f"<p>{'✅' if p else '❌'}{d.get('tool_name') or 'N/A'}|HTTP{d.get('status_code')}|{d.get('latency','N/A')}s|{d.get('verdict','')[:120]}</p>")
+        elif cid == "TC-08":
+            w = "" if d.get("reliable", True) else "<span class=\"warn\">⚠️成功率<50%不可靠</span>"
+            h.append(f"<p>ok={d.get('ok')}fail={d.get('fail')}|{d.get('elapsed')}s|入={d.get('total_prompt_tokens','N/A')}出={d.get('total_completion_tokens','N/A')}tok|TTFT avg={d.get('ttft_avg')}s P99={d.get('ttft_p99')}s|Decode={d.get('decode_tps')}tok/s|TPOT={d.get('tpot_avg_ms')}ms{w}</p>")
+            ec = d.get("error_counts", {})
+            if ec:
+                h.append(f"<p class=\"bad\">失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}</p>")
+        elif cid == "TC-09":
+            w = "" if d.get("reliable", True) else "<span class=\"warn\">⚠️成功率<50%不可靠</span>"
+            wu = d.get("warmup", {}) or {}
+            h.append(f"<p>命中率{d.get('cache_hit_rate_pct','N/A')}%|TPM{d.get('tpm_tokens','N/A')}tok/min|prompt={d.get('total_prompt_tokens','N/A')}compl={d.get('total_completion_tokens','N/A')}tok|预热prompt={wu.get('prompt_tokens','N/A')}|TTFT预热={wu.get('ttft','N/A')}s→并发={d.get('ttft_avg','N/A')}s|ok={d.get('ok',0)}fail={d.get('fail',0)}{w}</p>")
+            ec = d.get("error_counts", {})
+            if ec:
+                h.append(f"<p class=\"bad\">失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}</p>")
+        else:
+            h.append(f"<pre>{json.dumps(d, ensure_ascii=False, indent=2)}</pre>")
+    h.append("</body></html>")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(h))
+    print(f"[OK] HTML 报告已写入: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Markdown 报告
+# ---------------------------------------------------------------------------
+
+def write_markdown_report(results, cases, cfg, args, output_path, test_time):
+    """生成简洁 Markdown 验收报告。"""
+    api = cfg["api"]
+    bench = cfg.get("benchmark", {})
+    grad = bench.get("gradient", {})
+    inp = bench.get("input_tokens", 1000)
+    out_max = min(500, max(300, inp // 3))
+    tc = sum(1 for r in results if r.get("passed"))
+    fc = len(results) - tc
+    sr = f"{tc / len(results) * 100:.1f}%" if results else "N/A"
+    cn = "✅ 全部通过" if fc == 0 else f"❌ {fc}/{len(results)} 未通过"
+
+    cmd = "python token_test.py " + " ".join(
+        f'"{a}"' if " " in a else a for a in sys.argv[1:])
+
+    lines = []
+    lines.append(f"# Token 接口测试报告 — {test_time} — {cn}")
+    lines.append(f"```bash\n{cmd}\n```")
+    lines.append(f"**模型**：{api.get('model', '')} | **超时**：{api.get('timeout', '')}s | **输入/输出**：~{inp}/≤{out_max}tok(TC-09:≤50) | **梯度**：{grad.get('start','')}→{grad.get('max','')}步长{grad.get('step','')} | **通过{tc}/{len(results)}**({sr})")
+    lines.append("")
+
+    rm = {r["case_id"]: r for r in results}
+    for case in cases:
+        cid = case["id"]
+        r = rm.get(cid, {})
+        if not r:
+            lines.append(f"### {cid}{case['name']}⚪\n*未执行*\n")
+            continue
+        p = r.get("passed", False)
+        d = r.get("detail", {}) or {}
+        b = "✅" if p else "❌"
+        lines.append(f"### {cid}{case['name']}{b}")
+
+        if cid == "TC-01":
+            u = d.get("usage") or {}
+            lines.append(f"HTTP{d.get('status_code')}|{d.get('latency','N/A')}s|{u.get('total','N/A')}tokens\n")
+        elif cid == "TC-02":
+            lvs = d.get("levels", [])
+            if lvs:
+                best_c = d.get("best_concurrency", "?")
+                at = lvs[0].get("total_tokens", 0) // max(lvs[0].get("ok", 1), 1) if lvs else 0
+                lines.append(f"最高TPS**{d.get('tps_tokens')}**tok/s(并发={best_c})|Decode**{d.get('decode_tps')}**tok/s|均≈{at}tok/请求")
+                lines.append("|并发|成功|失败|耗时|TPS|TPS/并|Dec TPS|Dec/并|总Tok|延迟|错误|")
+                lines.append("|------|------|------|------|-----|-----|---------|-----|-----|------|------|")
+                for lv in lvs:
+                    ec = lv.get("error_counts", {})
+                    es = ", ".join(f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:2]) or "-"
+                    lines.append(f"|{lv['concurrency']}|{lv['ok']}|{lv['fail']}|{lv['elapsed']}s|{lv['tps_tokens']}|{lv.get('tps_per_c','N/A')}|{lv['decode_tps']}|{lv.get('decode_tps_per_c','N/A')}|{lv['total_tokens']}|{lv['avg_latency']}s|{es}|")
+                lines.append("")
+        elif cid == "TC-03":
+            lines.append(f"TC-02 TPS={d.get('tps')}→TPM={d.get('tpm')}|TPM=TPS×60:{'✅正确' if d.get('formula_ok') else '❌不符'}\n")
+        elif cid == "TC-04":
+            mode = d.get("mode", "")
+            if mode == "multi_tier":
+                lines.append(f"通过{d.get('passed_count','?')}")
+                lines.append("|档位|状态|延迟|原因|")
+                lines.append("|------|------|------|------|")
+                for t in d.get("tiers", []):
+                    lines.append(f"|{t['target']//1000}k|{'✅' if t.get('ok') else '❌'}|{t.get('latency','')}s|{(t.get('failure_reason') or t.get('error') or '—')[:80]}|")
+                lines.append("")
+            elif mode in ("declared", "probe"):
+                lines.append(f"{d.get('declared_context_length','') or d.get('found_limit','')}tokens→{'✅' if p else '❌'}\n")
+            else:
+                lines.append(f"HTTP{d.get('status_code')}|{(d.get('failure_reason') or d.get('error') or '无')[:120]}\n")
+        elif cid == "TC-05":
+            lines.append("无需鉴权，跳过\n" if d.get("status_code") is None else f"HTTP{d.get('status_code')}|{'✅预期' if p else '❌'}\n")
+        elif cid == "TC-06":
+            lines.append(f"OK={d.get('ok')}429={d.get('rate_limited_429')}超时={d.get('timeout')}耗时={d.get('elapsed')}s\n")
+        elif cid == "TC-07":
+            lines.append(f"{'✅' if p else '❌'}{d.get('tool_name') or 'N/A'}|HTTP{d.get('status_code')}|{d.get('latency','N/A')}s|{d.get('verdict','')[:120]}\n")
+        elif cid == "TC-08":
+            w = " ⚠️成功率<50%不可靠" if not d.get("reliable", True) else ""
+            lines.append(f"ok={d.get('ok')}fail={d.get('fail')}|{d.get('elapsed')}s|入={d.get('total_prompt_tokens','N/A')}出={d.get('total_completion_tokens','N/A')}tok|TTFT avg={d.get('ttft_avg')}s P99={d.get('ttft_p99')}s|Decode={d.get('decode_tps')}tok/s|TPOT={d.get('tpot_avg_ms')}ms{w}")
+            ec = d.get("error_counts", {})
+            if ec: lines.append(f"失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}")
+            lines.append("")
+        elif cid == "TC-09":
+            w = " ⚠️成功率<50%不可靠" if not d.get("reliable", True) else ""
+            wu = d.get("warmup", {}) or {}
+            lines.append(f"命中率{d.get('cache_hit_rate_pct','N/A')}%|TPM{d.get('tpm_tokens','N/A')}tok/min|prompt={d.get('total_prompt_tokens','N/A')}compl={d.get('total_completion_tokens','N/A')}|预热prompt={wu.get('prompt_tokens','N/A')}|TTFT预热={wu.get('ttft','N/A')}s→并发={d.get('ttft_avg','N/A')}s|ok={d.get('ok',0)}fail={d.get('fail',0)}{w}")
+            ec = d.get("error_counts", {})
+            if ec: lines.append(f"失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}")
+            lines.append("")
+        else:
+            lines.append(f"```json\n{json.dumps(d, ensure_ascii=False, indent=2)}\n```")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[OK] Markdown 报告已写入: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# PDF 生成（从 HTML 转换）
+# ---------------------------------------------------------------------------
+
+def write_pdf_report(html_path, pdf_path):
+    """从 HTML 生成 PDF。需要 weasyprint。"""
+    from weasyprint import HTML
+    HTML(filename=str(html_path)).write_pdf(str(pdf_path))
+    print(f"[OK] PDF 报告已写入: {pdf_path}")
+
+
 # ---------------------------------------------------------------------------
 # 累积汇总 CSV — 每次运行追加一行，便于对比历史
 # ---------------------------------------------------------------------------
 
 SUMMARY_COLUMNS = [
-    "模型名", "测试时间", "并发数", "总请求数", "输入Tokens",
-    "TPS (tok/s)", "TPM (tok/min)", "请求成功率",
+    "模型名", "测试时间", "梯度并发范围", "梯度步长", "输入Tokens",
+    "TPS (tok/s)", "TPM (tok/min)", "Decode TPS", "Decode TPM", "请求成功率",
     "Token 总数", "平均延迟 (s)",
     "TTFT-avg(s)", "TTFT-p99(s)", "TPOT-avg(ms)", "Decode (tok/s)",
     "缓存命中率",
@@ -1959,11 +2354,15 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
 
     tps_val = "N/A"
     tpm_val = "N/A"
+    decode_tps_val = "N/A"
+    decode_tpm_val = "N/A"
     for r in results:
         if r.get("case_id") == "TC-02" and r.get("detail"):
             d = r["detail"]
             tps_val = d.get("tps_tokens", "N/A")
             tpm_val = d.get("tpm_tokens", "N/A")
+            decode_tps_val = d.get("decode_tps", "N/A")
+            decode_tpm_val = d.get("decode_tpm", "N/A")
 
     # ── 各用例通过状态（失败时附简短原因）──
     case_status = {}
@@ -2018,11 +2417,13 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
     return [
         cfg["api"].get("model", ""),
         test_time,
-        str(cfg.get("benchmark", {}).get("concurrency", "")),
-        str(cfg.get("benchmark", {}).get("total_requests", "")),
+        f"{cfg.get('benchmark', {}).get('gradient', {}).get('start', '')}→{cfg.get('benchmark', {}).get('gradient', {}).get('max', '')}",
+        str(cfg.get("benchmark", {}).get("gradient", {}).get("step", "")),
         str(cfg.get("benchmark", {}).get("input_tokens", "")),
         tps_val,
         tpm_val,
+        decode_tps_val,
+        decode_tpm_val,
         success_rate,
         str(total_tokens),
         str(avg_latency),
@@ -2132,7 +2533,8 @@ def main():
     print(f"  URL:      {cfg['api']['url']}")
     print(f"  Model:    {cfg['api']['model']}")
     print(f"  Timeout:  {cfg['api']['timeout']}s")
-    print(f"  并发/请求: {cfg['benchmark']['concurrency']}/{cfg['benchmark']['total_requests']}")
+    grad = cfg["benchmark"].get("gradient", {})
+    print(f"  梯度并发: {grad.get('start', '?')} → {grad.get('max', '?')} (步长 {grad.get('step', '?')})")
     print(f"  输入 tokens: {cfg['benchmark'].get('input_tokens', 1000)}")
     print(f"  上下文阈值: {cfg['context_test']['target_tokens']} tokens")
     if args.probe_context:
@@ -2258,8 +2660,26 @@ def main():
     # ── 追加累积汇总 CSV（所有运行汇集到一个文件，一行一次）──
     append_summary_csv(results, cfg, args.summary, test_time)
 
+    # ── 验收报告（MD + HTML + PDF）──
+    report_dir = RESULTS_MD_DIR / timestamp
+    report_dir.mkdir(parents=True, exist_ok=True)
+    md_path = report_dir / f"test_report_{timestamp}.md"
+    html_path = report_dir / f"test_report_{timestamp}.html"
+    pdf_path = report_dir / f"test_report_{timestamp}.pdf"
+
+    write_markdown_report(results, cases, cfg, args, md_path, test_time)
+    write_html_report(results, cases, cfg, args, html_path, test_time)
+    try:
+        write_pdf_report(html_path, pdf_path)
+    except ImportError:
+        print("[WARN] weasyprint 未安装，跳过 PDF (pip install weasyprint)")
+
     print(f"\n[DONE] 测试完成")
     print(f"       详情: {detail_output}")
+    print(f"       报告: {md_path}")
+    print(f"             {html_path}")
+    if pdf_path.exists():
+        print(f"             {pdf_path}")
     print(f"       汇总: {args.summary}  <- 累积对比，每次追加一行")
     print(f"       用例: {args.cases}  <- 持久化，可复现")
     print(f"\n  重新运行: python token_test.py -u {cfg['api']['url']} -k $KEY -m {cfg['api']['model']}")

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('token_test.py', encoding='utf-8'\\).read\\(\\)\\); print\\('语法检查通过'\\)\")",
+      "Bash(python token_test.py -n 2 -c 2 --context-tokens 128k --input-tokens 1k -t 30)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('token_test.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python token_test.py --help)",
+      "Bash(python -c \"from weasyprint import HTML; print\\('weasyprint: OK'\\)\")",
+      "Bash(python -m pip install weasyprint)"
+    ]
+  }
+}
