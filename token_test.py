@@ -49,6 +49,7 @@ CONFIG_PATH   = BASE_DIR / "test_config.json"
 CASES_PATH    = BASE_DIR / "test_cases.json"
 RESULTS_DIR   = BASE_DIR / "results"                  # 每次运行的详情输出目录
 RESULTS_MD_DIR = BASE_DIR / "result_md"              # 验收报告输出目录
+RESULTS_MD_DIR = BASE_DIR / "result_md"              # 验收报告输出目录
 SUMMARY_PATH  = BASE_DIR / "test_summary.csv"         # 累积汇总文件（每次追加一行）
 
 # 北京时间
@@ -193,6 +194,29 @@ def _chunk_keys(chunk: dict) -> dict:
             info[k] = type(v).__name__
     return info
 
+
+
+def _error_category(error_msg: str, status_code: int = None) -> str:
+    if error_msg == "请求超时": return "请求超时"
+    if error_msg and error_msg.startswith("连接失败"): return "连接失败"
+    if error_msg.startswith("未收到任何 token"): return "流式无输出"
+    if status_code and status_code >= 400: return f"HTTP {status_code}"
+    if status_code and status_code < 400 and error_msg: return f"HTTP {status_code}: {error_msg[:40]}"
+    if error_msg: return error_msg[:60]
+    return "未知错误"
+
+
+def _chunk_keys(chunk: dict) -> dict:
+    info = {}
+    for k, v in chunk.items():
+        if k == "choices" and isinstance(v, list) and v:
+            delta = v[0].get("delta", {}) if isinstance(v[0], dict) else {}
+            info["choices[0].delta"] = list(delta.keys()) if delta else "(empty)"
+            info["choices[0].finish_reason"] = v[0].get("finish_reason") if isinstance(v[0], dict) else None
+        elif isinstance(v, dict): info[k] = list(v.keys())
+        elif isinstance(v, list): info[k] = f"[{len(v)}]"
+        else: info[k] = type(v).__name__
+    return info
 
 def _percentiles(data: list, *ps) -> dict:
     """计算百分位值。data 为空时返回 {p: 0 for p in ps}。"""
@@ -898,7 +922,7 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
             futures = []
             for i in range(total):
                 futures.append(pool.submit(_worker, i))
-                time.sleep(0.02)  # 20ms stagger
+                time.sleep(0.02)
             for f in as_completed(futures):
                 f.result()
         elapsed = time.perf_counter() - t0
@@ -953,8 +977,6 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
                        "tps_tokens": best["tps_tokens"], "tpm_tokens": best["tpm_tokens"],
                        "decode_tps": best["decode_tps"], "decode_tpm": best["decode_tpm"],
                        "best_concurrency": best["concurrency"]}}
-
-
 def test_tpm_calc(cfg: dict, case: dict, prev_result: dict = None) -> dict:
     """TC-03: TPM 换算 — 基于 TC-02 的 TPS 结果验证 TPM = TPS x 60。"""
     passed = False
@@ -1175,6 +1197,12 @@ def test_auth_failure(cfg: dict, case: dict) -> dict:
         return {"case_id": case["id"], "passed": True,
                 "detail": {"status_code": None, "expected_codes": "N/A（无需鉴权）",
                            "error": None, "note": "未提供 API Key，服务不需要鉴权"}}
+    key = api.get("key", "").strip()
+    if not key or key == "sk-your-api-key-here":
+        return {"case_id": case["id"], "passed": True,
+                "detail": {"status_code": None, "expected_codes": "N/A（无需鉴权）",
+                           "error": None, "note": "未提供 API Key，服务不需要鉴权"}}
+
     result = api_request(
         url=api["url"],
         key="sk-invalid-key-for-testing",
@@ -1534,6 +1562,7 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
     itl_over_req_pct = round(stats["itl_over_500ms_requests"] / n_ok * 100, 1)
 
     ok_rate = stats["ok"] / total * 100 if total else 0
+    ok_rate = stats["ok"] / total * 100 if total else 0
     passed = stats["ok"] > 0
 
     return {
@@ -1541,6 +1570,7 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
         "passed": passed,
         "detail": {
             "elapsed": round(elapsed, 2),
+            "reliable": ok_rate >= 50,
             "reliable": ok_rate >= 50,
             "ok": stats["ok"],
             "fail": stats["fail"],
@@ -1750,6 +1780,7 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
     return {
         "case_id": case["id"],
         "passed": stats["ok"] > 0 and cache_hit,
+            "reliable": (stats["ok"] / total * 100 >= 50) if total else False,
         "detail": {
             "reliable": (stats["ok"] / total * 100 >= 50) if total else False,
             "warmup": {
@@ -1854,6 +1885,8 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
             tpm_val = d.get("tpm_tokens", "N/A")
             decode_tps_val = d.get("decode_tps", "N/A")
             decode_tpm_val = d.get("decode_tpm", "N/A")
+            decode_tps_val = d.get("decode_tps", "N/A")
+            decode_tpm_val = d.get("decode_tpm", "N/A")
 
     key_display = api.get("key", "")
     if len(key_display) > 20:
@@ -1925,22 +1958,25 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 if detail.get("mode") == "gradient":
                     lvs = detail.get("levels", [])
                     best_c = detail.get("best_concurrency", "?")
-                    actual = (f"梯度{lvs[0]['concurrency']}→{lvs[-1]['concurrency']}({len(lvs)}级), "
-                              f"最高TPS={detail.get('tps_tokens')}tok/s(并发={best_c}), "
-                              f"Decode={detail.get('decode_tps')}tok/s, "
-                              f"总成功/失败={detail.get('ok')}/{detail.get('fail')}")
+                if detail.get("mode") == "gradient":
+                    lvs = detail.get("levels", [])
+                    best_c = detail.get("best_concurrency", "?")
+                    actual = (f"梯度{lvs[0]["concurrency"]}→{lvs[-1]["concurrency"]}({len(lvs)}级), "
+                              f"最高TPS={detail.get("tps_tokens")}tok/s(并发={best_c}), "
+                              f"Decode={detail.get("decode_tps")}tok/s, "
+                              f"总成功/失败={detail.get("ok")}/{detail.get("fail")}")
                 else:
                     actual = (
-                        f"成功{detail.get('ok')}/{detail.get('ok',0)+detail.get('fail',0)}, "
-                        f"TPS={detail.get('tps_tokens')}tok/s, "
-                        f"TPM={detail.get('tpm_tokens')}tok/min, "
-                        f"Decode={detail.get('decode_tps','N/A')}tok/s, "
-                        f"平均延迟{detail.get('avg_latency')}s"
+                        f"成功{detail.get("ok")}/{detail.get("ok",0)+detail.get("fail",0)}, "
+                        f"TPS={detail.get("tps_tokens")}tok/s, "
+                        f"TPM={detail.get("tpm_tokens")}tok/min, "
+                        f"Decode={detail.get("decode_tps","N/A")}tok/s, "
+                        f"平均延迟{detail.get("avg_latency")}s"
                     )
                     ec = detail.get("error_counts", {})
                     if ec:
                         parts = [f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:3]]
-                        actual += f", 失败:{', '.join(parts)}"
+                        actual += f", 失败:{", ".join(parts)}"
             elif cid == "TC-03":
                 actual = (
                     f"TPS={detail.get('tps')}, TPM={detail.get('tpm')}, "
@@ -2037,175 +2073,8 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
         writer.writerows(rows)
 
     print(f"[OK] 结果已写入: {output_path}")
-
-
 # ---------------------------------------------------------------------------
-# HTML 报告样式 & 生成
-# ---------------------------------------------------------------------------
-
-_HTML_CSS = """
-body{font-family:system-ui,sans-serif;max-width:1100px;margin:20px auto;padding:0 16px;color:#1a1a1a}
-h1{font-size:1.3em;margin:0 0 4px}.pass{color:#1a7f37}.fail{color:#cf222e}.warn{color:#9a6700}
-.meta{color:#666;font-size:.85em;margin:0 0 16px;line-height:1.5}.meta b{color:#333}
-h2{font-size:1.1em;border-bottom:2px solid #d0d7de;padding-bottom:4px;margin:20px 0 12px}
-h3{font-size:.95em;margin:14px 0 4px}.badge{font-weight:600}
-table{border-collapse:collapse;width:100%;margin:6px 0 12px;font-size:.85em}
-th,td{padding:4px 8px;text-align:left;border-bottom:1px solid #d0d7de}
-th{background:#f6f8fa;font-weight:600}.ok{color:#1a7f37}.bad{color:#cf222e}
-tr:hover{background:#f6f8fa}pre{background:#f6f8fa;padding:8px 12px;border-radius:4px;font-size:.82em;overflow:auto}
-.note{color:#666;font-size:.85em}details{margin:4px 0}summary{cursor:pointer;color:#0969da}
-"""
-
-
-def _html_tc01(d):
-    u = d.get("usage") or {}
-    return f"HTTP {d.get('status_code')} | {d.get('latency', 'N/A')}s | {u.get('total', 'N/A')} tokens"
-
-
-def _html_tc02(d):
-    lvs = d.get("levels", [])
-    if not lvs:
-        return ""
-    best_c = d.get("best_concurrency", "?")
-    avg_tok = lvs[0].get("total_tokens", 0) // max(lvs[0].get("ok", 1), 1) if lvs else 0
-    h = [f"<p>最高 TPS <b>{d.get('tps_tokens')}</b> tok/s(并发={best_c}) | Decode <b>{d.get('decode_tps')}</b> tok/s | 均≈{avg_tok} tok/请求</p>"]
-    h.append("<table><tr><th>并发</th><th>成功</th><th>失败</th><th>耗时</th><th>TPS</th><th>TPS/并</th><th>Dec TPS</th><th>Dec/并</th><th>总Tok</th><th>延迟</th><th>错误</th></tr>")
-    for lv in lvs:
-        ec = lv.get("error_counts", {})
-        es = ", ".join(f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:2]) or "-"
-        h.append(f"<tr><td>{lv['concurrency']}</td><td class=\"ok\">{lv['ok']}</td><td class=\"bad\">{lv['fail']}</td><td>{lv['elapsed']}s</td><td>{lv['tps_tokens']}</td><td>{lv.get('tps_per_c', 'N/A')}</td><td>{lv['decode_tps']}</td><td>{lv.get('decode_tps_per_c', 'N/A')}</td><td>{lv['total_tokens']}</td><td>{lv['avg_latency']}s</td><td>{es}</td></tr>")
-    h.append("</table>")
-    return "\n".join(h)
-
-
-def _html_tc04(d, passed):
-    mode = d.get("mode", "")
-    if mode == "multi_tier":
-        h = [f"<p>通过 {d.get('passed_count', '?')}</p><table><tr><th>档位</th><th>状态</th><th>延迟</th><th>原因</th></tr>"]
-        for t in d.get("tiers", []):
-            reason = (t.get("failure_reason") or t.get("error") or "—")[:80]
-            h.append(f"<tr><td>{t['target']//1000}k</td><td>{'✅' if t.get('ok') else '❌'}</td><td>{t.get('latency', '')}s</td><td>{reason}</td></tr>")
-        h.append("</table>")
-        return "\n".join(h)
-    if mode == "declared":
-        return f"声明 {d.get('declared_context_length')} tokens → {'✅' if passed else '❌'} {d.get('reason', '')}"
-    if mode == "probe":
-        return f"探测上限 {d.get('found_limit')} tokens(目标 {d.get('targets')}, {d.get('attempts_count', 0)}次)"
-    return f"HTTP {d.get('status_code')} | {(d.get('failure_reason') or d.get('error') or '无')[:120]}"
-
-
-def write_html_report(results, cases, cfg, args, output_path, test_time,
-                       model_info=None):
-    """生成自包含 HTML 验收报告。"""
-    api = cfg["api"]
-    bench = cfg.get("benchmark", {})
-    grad = bench.get("gradient", {})
-    inp = bench.get("input_tokens", 1000)
-    out_max = min(500, max(300, inp // 3))
-    tc = sum(1 for r in results if r.get("passed"))
-    fc = len(results) - tc
-    sr = f"{tc / len(results) * 100:.1f}%" if results else "N/A"
-    cn = "全部通过" if fc == 0 else f"{fc}/{len(results)} 未通过"
-    cn_cls = "pass" if fc == 0 else "fail"
-
-    # 关键指标提取
-    tps_val = decode_tps_val = ttft_avg = ttft_p99 = tpot_avg = cr = "N/A"
-    for r in results:
-        d = r.get("detail", {}) or {}
-        if r.get("case_id") == "TC-02":
-            tps_val = d.get("tps_tokens", "N/A")
-            decode_tps_val = d.get("decode_tps", "N/A")
-        if r.get("case_id") == "TC-08":
-            ttft_avg = d.get("ttft_avg", "N/A")
-            ttft_p99 = d.get("ttft_p99", "N/A")
-            tpot_avg = d.get("tpot_avg_ms", "N/A")
-        if r.get("case_id") == "TC-09":
-            cr = f"{d.get('cache_hit_rate_pct', 'N/A')}%"
-
-    cmd = "python token_test.py " + " ".join(
-        f'"{a}"' if " " in a else a for a in sys.argv[1:])
-
-    # 平台信息
-    plat = [f"<b>{api.get('model', '')}</b>"]
-    if getattr(args, 'platform', ''):
-        plat.append(args.platform)
-    plat.append(f"超时{api.get('timeout', '')}s")
-    plat.append(f"输入/输出~{inp}/≤{out_max}tok")
-    plat.append(f"梯度{grad.get('start','')}→{grad.get('max','')}步长{grad.get('step','')}")
-    plat.append(f"通过{tc}/{len(results)}({sr})")
-
-    h = []
-    h.append(f"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>测试报告—{test_time}</title><style>{_HTML_CSS}</style></head><body>")
-    h.append(f"<h1>Token接口测试报告<span class=\"{cn_cls}\">{'✅' if fc==0 else '❌'}{cn}</span></h1>")
-    h.append(f"<div class=\"meta\">{' | '.join(plat)}</div>")
-    h.append(f"<pre>{cmd}</pre>")
-
-    # 关键指标摘要
-    m = []
-    if tps_val != "N/A": m.append(f"TPS{tps_val}tok/s")
-    if decode_tps_val != "N/A": m.append(f"Decode{decode_tps_val}tok/s")
-    if ttft_avg != "N/A": m.append(f"TTFT avg{ttft_avg}s P99{ttft_p99}s")
-    if tpot_avg != "N/A": m.append(f"TPOT{tpot_avg}ms")
-    if cr != "N/A": m.append(f"缓存{cr}")
-    if m:
-        h.append(f"<div class=\"note\">{' | '.join(m)}</div>")
-
-    h.append("<h2>详细结果</h2>")
-    rm = {r["case_id"]: r for r in results}
-
-    for case in cases:
-        cid = case["id"]
-        r = rm.get(cid, {})
-        if not r:
-            h.append(f"<h3>{cid}{case['name']}<span class=\"badge\">⚪</span></h3><p class=\"note\">未执行</p>")
-            continue
-        p = r.get("passed", False)
-        d = r.get("detail", {}) or {}
-        b = f"<span class=\"badge {'pass' if p else 'fail'}\">{'✅' if p else '❌'}</span>"
-        h.append(f"<h3>{cid}{case['name']}{b}</h3>")
-
-        if cid == "TC-01":
-            h.append(f"<p>{_html_tc01(d)}</p>")
-        elif cid == "TC-02":
-            h.append(_html_tc02(d))
-        elif cid == "TC-03":
-            ok = "✅正确" if d.get("formula_ok") else "❌不符"
-            h.append(f"<p>TC-02 TPS={d.get('tps')}→TPM={d.get('tpm')}|TPM=TPS×60:{ok}</p>")
-        elif cid == "TC-04":
-            h.append(f"<p>{_html_tc04(d, p)}</p>")
-        elif cid == "TC-05":
-            if d.get("status_code") is None:
-                h.append("<p class=\"note\">无需鉴权，跳过</p>")
-            else:
-                h.append(f"<p>HTTP{d.get('status_code')}|{'✅预期' if p else '❌'}</p>")
-        elif cid == "TC-06":
-            h.append(f"<p>OK={d.get('ok')}429={d.get('rate_limited_429')}超时={d.get('timeout')}耗时={d.get('elapsed')}s</p>")
-        elif cid == "TC-07":
-            h.append(f"<p>{'✅' if p else '❌'}{d.get('tool_name') or 'N/A'}|HTTP{d.get('status_code')}|{d.get('latency','N/A')}s|{d.get('verdict','')[:120]}</p>")
-        elif cid == "TC-08":
-            w = "" if d.get("reliable", True) else "<span class=\"warn\">⚠️成功率<50%不可靠</span>"
-            h.append(f"<p>ok={d.get('ok')}fail={d.get('fail')}|{d.get('elapsed')}s|入={d.get('total_prompt_tokens','N/A')}出={d.get('total_completion_tokens','N/A')}tok|TTFT avg={d.get('ttft_avg')}s P99={d.get('ttft_p99')}s|Decode={d.get('decode_tps')}tok/s|TPOT={d.get('tpot_avg_ms')}ms{w}</p>")
-            ec = d.get("error_counts", {})
-            if ec:
-                h.append(f"<p class=\"bad\">失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}</p>")
-        elif cid == "TC-09":
-            w = "" if d.get("reliable", True) else "<span class=\"warn\">⚠️成功率<50%不可靠</span>"
-            wu = d.get("warmup", {}) or {}
-            h.append(f"<p>命中率{d.get('cache_hit_rate_pct','N/A')}%|TPM{d.get('tpm_tokens','N/A')}tok/min|prompt={d.get('total_prompt_tokens','N/A')}compl={d.get('total_completion_tokens','N/A')}tok|预热prompt={wu.get('prompt_tokens','N/A')}|TTFT预热={wu.get('ttft','N/A')}s→并发={d.get('ttft_avg','N/A')}s|ok={d.get('ok',0)}fail={d.get('fail',0)}{w}</p>")
-            ec = d.get("error_counts", {})
-            if ec:
-                h.append(f"<p class=\"bad\">失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}</p>")
-        else:
-            h.append(f"<pre>{json.dumps(d, ensure_ascii=False, indent=2)}</pre>")
-    h.append("</body></html>")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(h))
-    print(f"[OK] HTML 报告已写入: {output_path}")
-
-
-# ---------------------------------------------------------------------------
-# Markdown 报告
+# HTML 验收报告模板 — 从 Markdown 转换并注入美观样式
 # ---------------------------------------------------------------------------
 
 def write_markdown_report(results, cases, cfg, args, output_path, test_time):
@@ -2218,15 +2087,15 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
     tc = sum(1 for r in results if r.get("passed"))
     fc = len(results) - tc
     sr = f"{tc / len(results) * 100:.1f}%" if results else "N/A"
-    cn = "✅ 全部通过" if fc == 0 else f"❌ {fc}/{len(results)} 未通过"
-
-    cmd = "python token_test.py " + " ".join(
-        f'"{a}"' if " " in a else a for a in sys.argv[1:])
+    cn = "全部通过" if fc == 0 else f"{fc}/{len(results)} 未通过"
+    cmd = "python token_test.py " + " ".join(f'"{a}"' if " " in a else a for a in sys.argv[1:])
 
     lines = []
-    lines.append(f"# Token 接口测试报告 — {test_time} — {cn}")
+    lines.append(f"# Token 接口测试报告 — {test_time} — {'✅' if fc==0 else '❌'}{cn}")
     lines.append(f"```bash\n{cmd}\n```")
-    lines.append(f"**模型**：{api.get('model', '')} | **超时**：{api.get('timeout', '')}s | **输入/输出**：~{inp}/≤{out_max}tok(TC-09:≤50) | **梯度**：{grad.get('start','')}→{grad.get('max','')}步长{grad.get('step','')} | **通过{tc}/{len(results)}**({sr})")
+    plat = getattr(args, 'platform', '')
+    plat_str = f" | **平台**：{plat}" if plat else ""
+    lines.append(f"**模型**：{api.get('model', '')} | **超时**：{api.get('timeout', '')}s | **输入/输出**：~{inp}/≤{out_max}tok(TC-09:≤50) | **梯度**：{grad.get('start','')}→{grad.get('max','')}步长{grad.get('step','')}{plat_str} | **通过{tc}/{len(results)}**({sr})")
     lines.append("")
 
     rm = {r["case_id"]: r for r in results}
@@ -2299,21 +2168,46 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
     print(f"[OK] Markdown 报告已写入: {output_path}")
 
 
-# ---------------------------------------------------------------------------
-# PDF 生成（从 HTML 转换）
-# ---------------------------------------------------------------------------
+def write_html_report(results, cases, cfg, args, output_path, test_time, model_info=None):
+    """使用 template.html 从 Markdown 生成美观 HTML 报告。"""
+    from generate_report import parse_markdown, generate_html
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as tmp:
+        md_tmp = tmp.name
+    try:
+        write_markdown_report(results, cases, cfg, args, Path(md_tmp), test_time)
+        with open(md_tmp, 'r', encoding='utf-8') as f:
+            md_text = f.read()
+    finally:
+        os.unlink(md_tmp)
+    parsed = parse_markdown(md_text)
+    html = generate_html(parsed)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f"[OK] HTML 报告已写入: {output_path}")
+
 
 def write_pdf_report(html_path, pdf_path):
-    """从 HTML 生成 PDF。需要 weasyprint。"""
-    from weasyprint import HTML
-    HTML(filename=str(html_path)).write_pdf(str(pdf_path))
-    print(f"[OK] PDF 报告已写入: {pdf_path}")
+    """使用 Chrome/Edge 无头浏览器将 HTML 转为 PDF。"""
+    from generate_report import find_browser
+    import subprocess
+    browser = find_browser()
+    if not browser:
+        print("[WARN] 未找到 Chrome/Edge 浏览器，跳过 PDF")
+        return
+    subprocess.run([browser, "--headless", "--disable-gpu",
+                    f"--print-to-pdf={pdf_path}", "--no-pdf-header-footer",
+                    f"file:///{html_path}"],
+                   capture_output=True, timeout=30)
+    if os.path.exists(pdf_path):
+        print(f"[OK] PDF 报告已写入: {pdf_path}")
+    else:
+        print("[WARN] PDF 生成失败")
 
 
 # ---------------------------------------------------------------------------
 # 累积汇总 CSV — 每次运行追加一行，便于对比历史
 # ---------------------------------------------------------------------------
-
 SUMMARY_COLUMNS = [
     "模型名", "测试时间", "梯度并发范围", "梯度步长", "输入Tokens",
     "TPS (tok/s)", "TPM (tok/min)", "Decode TPS", "Decode TPM", "请求成功率",
@@ -2670,9 +2564,9 @@ def main():
     write_markdown_report(results, cases, cfg, args, md_path, test_time)
     write_html_report(results, cases, cfg, args, html_path, test_time)
     try:
-        write_pdf_report(html_path, pdf_path)
-    except ImportError:
-        print("[WARN] weasyprint 未安装，跳过 PDF (pip install weasyprint)")
+        write_pdf_report(str(html_path.resolve()), str(pdf_path))
+    except Exception as e:
+        print(f"[WARN] PDF 生成失败: {e}")
 
     print(f"\n[DONE] 测试完成")
     print(f"       详情: {detail_output}")

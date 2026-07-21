@@ -6,7 +6,9 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('token_test.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python token_test.py --help)",
       "Bash(python -c \"from weasyprint import HTML; print\\('weasyprint: OK'\\)\")",
-      "Bash(python -m pip install weasyprint)"
+      "Bash(python -m pip install weasyprint)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pip install markdown)"
     ]
   }
 }
