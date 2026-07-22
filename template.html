@@ -31,6 +31,7 @@
             background: #f8f9fa; border-radius: 12px; padding: 25px;
             margin-bottom: 25px; border-left: 5px solid #4CAF50;
             box-shadow: 0 4px 15px rgba(0,0,0,0.1); transition: transform 0.2s, box-shadow 0.2s;
+            break-inside: avoid; page-break-inside: avoid;
         }
         .test-case:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.15); }
         .test-case h2 { color: #2c3e50; margin-bottom: 15px; font-size: 1.5em; display: flex; align-items: center; }
@@ -39,10 +40,14 @@
             background: white; padding: 15px; border-radius: 8px;
             margin-bottom: 15px; border: 1px solid #e0e0e0;
         }
+        .test-case .table-wrap {
+            overflow-x: auto; -webkit-overflow-scrolling: touch;
+        }
         .test-case table {
-            width: 100%; border-collapse: collapse; margin-top: 15px;
+            border-collapse: collapse; margin-top: 15px;
             background: white; border-radius: 8px; overflow: hidden;
             box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            font-size: 0.85em; white-space: nowrap;
         }
         .test-case th { background: #3498db; color: white; padding: 12px 15px; text-align: left; font-weight: 600; }
         .test-case td { padding: 12px 15px; border-bottom: 1px solid #eee; }
@@ -56,6 +61,10 @@
         .pass { color: #4CAF50; font-weight: bold; }
         .fail { color: #e74c3c; font-weight: bold; }
         .footer { text-align: center; padding: 30px; background: #f1f1f1; color: #666; font-size: 0.9em; }
+        @media print {
+            .test-case, table, tr { break-inside: avoid; page-break-inside: avoid; }
+            thead { display: table-header-group; }
+        }
         @media (max-width: 768px) {
             .header h1 { font-size: 1.8em; }
             .content { padding: 20px; }

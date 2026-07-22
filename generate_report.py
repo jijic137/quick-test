@@ -10,6 +10,7 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
+import markdown
 
 SCRIPT_DIR = Path(__file__).parent
 TEMPLATE_PATH = SCRIPT_DIR / "template.html"
@@ -158,19 +159,22 @@ def render_test_case(tc):
 
     if tc["summary_lines"]:
         html += '  <div class="summary">\n'
-        for line in tc["summary_lines"]:
-            line_html = escape_html(line)
-            line_html = re.sub(
-                r"(\d+(?:\.\d+)?)",
-                r'<span class="highlight">\1</span>',
-                line_html,
-            )
-            html += f"    <p>{line_html}</p>\n"
+        md_text = "\n".join(tc["summary_lines"])
+        # 用 markdown 库转换，保留 **bold**、`code` 等格式
+        body_html = markdown.markdown(md_text, extensions=['fenced_code'])
+        # 数字高亮
+        body_html = re.sub(
+            r'(?<![>/\w])(\d+(?:\.\d+)?)(?![<>\w])',
+            r'<span class="highlight">\1</span>',
+            body_html,
+        )
+        html += body_html + "\n"
         html += "  </div>\n"
 
     if tc["table_header"]:
+        html += '  <div class="table-wrap">\n'
         html += render_table(tc["table_header"], tc["table_rows"])
-        html += "\n"
+        html += '  </div>\n'
 
     html += "</div>\n"
     return html

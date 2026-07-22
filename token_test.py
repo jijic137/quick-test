@@ -894,23 +894,29 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
     gradient = cfg["benchmark"].get("gradient", {})
 
     def _run_bench(concurrency: int, total: int):
-        stats = {"ok": 0, "fail": 0, "total_latency": 0.0,
+        stats = {"ok": 0, "fail": 0,
+                 "total_ttft": 0.0, "total_decode_time": 0.0, "total_latency": 0.0,
                  "total_prompt_tokens": 0, "total_completion_tokens": 0,
                  "total_tokens": 0, "errors": []}
 
         def _worker(_idx):
             varied_msgs = [dict(m) for m in messages]
             varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
-            r = api_request(url=api["url"], key=api["key"], model=api["model"],
-                            messages=varied_msgs, max_tokens=max_tokens, timeout=timeout)
+            r = api_request_stream(url=api["url"], key=api["key"], model=api["model"],
+                                    messages=varied_msgs, max_tokens=max_tokens,
+                                    timeout=timeout)
             with _stats_lock:
                 if r["ok"]:
                     stats["ok"] += 1
-                    stats["total_latency"] += r["latency"]
-                    if r["usage"]:
-                        stats["total_prompt_tokens"] += r["usage"]["prompt"]
-                        stats["total_completion_tokens"] += r["usage"]["completion"]
-                        stats["total_tokens"] += r["usage"]["total"]
+                    ttft = r.get("ttft", 0)
+                    total_lat = r.get("total_latency", 0)
+                    decode_t = total_lat - ttft if total_lat > ttft else 0
+                    stats["total_ttft"] += ttft
+                    stats["total_decode_time"] += decode_t
+                    stats["total_latency"] += total_lat
+                    stats["total_prompt_tokens"] += r.get("prompt_tokens", 0)
+                    stats["total_completion_tokens"] += r.get("completion_tokens", 0)
+                    stats["total_tokens"] += r.get("total_tokens", 0)
                 else:
                     stats["fail"] += 1
                     if r["error"] and len(stats["errors"]) < 20:
@@ -928,9 +934,16 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
         elapsed = time.perf_counter() - t0
 
         success_rate = stats["ok"] / total * 100 if total else 0
+        # 总 TPS = 总 token / 墙上时间
         tps_tokens = stats["total_tokens"] / elapsed if elapsed > 0 else 0
-        decode_tps = stats["total_completion_tokens"] / elapsed if elapsed > 0 else 0
+        # Decode TPS = 输出 token / decode 时间（total_latency - TTFT）
+        decode_tps = (stats["total_completion_tokens"] / stats["total_decode_time"]
+                      if stats["total_decode_time"] > 0 else 0)
+        # Prefill TPS = 输入 token / TTFT
+        prefill_tps = (stats["total_prompt_tokens"] / stats["total_ttft"]
+                       if stats["total_ttft"] > 0 else 0)
         avg_latency = stats["total_latency"] / stats["ok"] if stats["ok"] else 0
+        avg_ttft = stats["total_ttft"] / stats["ok"] if stats["ok"] else 0
 
         error_counts = {}
         for err in stats["errors"]:
@@ -943,8 +956,8 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
                 "tps_tokens": f"{tps_tokens:.1f}", "tpm_tokens": f"{tps_tokens * 60:.1f}",
                 "tps_per_c": round(tps_tokens / concurrency, 1) if concurrency else 0,
                 "decode_tps": f"{decode_tps:.1f}", "decode_tpm": f"{decode_tps * 60:.1f}",
-                "decode_tps_per_c": round(decode_tps / concurrency, 1) if concurrency else 0,
-                "avg_latency": round(avg_latency, 3),
+                "prefill_tps": f"{prefill_tps:.1f}",
+                "avg_latency": round(avg_latency, 3), "avg_ttft": round(avg_ttft, 3),
                 "total_tokens": stats["total_tokens"],
                 "total_prompt_tokens": stats["total_prompt_tokens"],
                 "total_completion_tokens": stats["total_completion_tokens"],
@@ -2119,12 +2132,12 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
                 best_c = d.get("best_concurrency", "?")
                 at = lvs[0].get("total_tokens", 0) // max(lvs[0].get("ok", 1), 1) if lvs else 0
                 lines.append(f"最高TPS**{d.get('tps_tokens')}**tok/s(并发={best_c})|Decode**{d.get('decode_tps')}**tok/s|均≈{at}tok/请求")
-                lines.append("|并发|成功|失败|耗时|TPS|TPS/并|Dec TPS|Dec/并|总Tok|延迟|错误|")
-                lines.append("|------|------|------|------|-----|-----|---------|-----|-----|------|------|")
+                lines.append("|并发|成功|失败|耗时|TPS|TPS/并|Dec TPS|Prefill TPS|总Tok|输入Tok|输出Tok|TTFT|延迟|错误|")
+                lines.append("|------|------|------|------|-----|-----|---------|-----------|-----|-----|-----|----|------|------|")
                 for lv in lvs:
                     ec = lv.get("error_counts", {})
                     es = ", ".join(f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:2]) or "-"
-                    lines.append(f"|{lv['concurrency']}|{lv['ok']}|{lv['fail']}|{lv['elapsed']}s|{lv['tps_tokens']}|{lv.get('tps_per_c','N/A')}|{lv['decode_tps']}|{lv.get('decode_tps_per_c','N/A')}|{lv['total_tokens']}|{lv['avg_latency']}s|{es}|")
+                    lines.append(f"|{lv['concurrency']}|{lv['ok']}|{lv['fail']}|{lv['elapsed']}s|{lv['tps_tokens']}|{lv.get('tps_per_c','N/A')}|{lv['decode_tps']}|{lv.get('prefill_tps','N/A')}|{lv['total_tokens']}|{lv['total_prompt_tokens']}|{lv['total_completion_tokens']}|{lv.get('avg_ttft','N/A')}s|{lv['avg_latency']}s|{es}|")
                 lines.append("")
         elif cid == "TC-03":
             lines.append(f"TC-02 TPS={d.get('tps')}→TPM={d.get('tpm')}|TPM=TPS×60:{'✅正确' if d.get('formula_ok') else '❌不符'}\n")
