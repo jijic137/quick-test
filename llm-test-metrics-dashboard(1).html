@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LLM 推理服务测试指标看板</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- Chart.js：优先 jsdelivr，失败自动回退 cdnjs -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>window.Chart||document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"><\/script>')</script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+<script>window.ChartDataLabels||document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"><\/script>')</script>
+<style>
+  :root{
+    --bg:#0B0D12;
+    --panel:#12151C;
+    --panel-border:#232838;
+    --grid:#1E2330;
+    --text:#E7E9F0;
+    --muted:#7C8499;
+    --cyan:#4FD8C4;
+    --amber:#F0A868;
+    --violet:#9A8CFF;
+    --rose:#F0708A;
+    --green:#6FD98C;
+    --mono:'IBM Plex Mono','SFMono-Regular',Consolas,monospace;
+    --sans:'Inter',-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:
+      radial-gradient(1200px 500px at 12% -10%, rgba(79,216,196,0.07), transparent 60%),
+      radial-gradient(1000px 500px at 92% 0%, rgba(154,140,255,0.06), transparent 60%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    padding:32px 40px 60px;
+  }
+  header{
+    display:flex; justify-content:space-between; align-items:flex-end;
+    border-bottom:1px solid var(--panel-border);
+    padding-bottom:20px; margin-bottom:24px; flex-wrap:wrap; gap:16px;
+  }
+  .brand-eyebrow{font-family:var(--mono); font-size:11px; letter-spacing:.18em; color:var(--cyan); text-transform:uppercase; margin-bottom:6px;}
+  h1{margin:0; font-size:25px; font-weight:650; letter-spacing:-0.01em;}
+  header .meta{font-family:var(--mono); font-size:12px; color:var(--muted); text-align:right; line-height:1.7;}
+  header .meta span{color:var(--text);}
+
+  .kpi-strip{
+    display:grid; grid-template-columns:repeat(7,1fr); gap:14px; margin-bottom:24px;
+  }
+  .kpi{
+    background:var(--panel); border:1px solid var(--panel-border); border-radius:10px;
+    padding:14px 16px; position:relative;
+  }
+  .kpi .k{font-family:var(--mono); font-size:10px; color:var(--muted); letter-spacing:.05em; text-transform:uppercase;}
+  .kpi .v{font-family:var(--mono); font-size:22px; font-weight:650; margin-top:6px;}
+  .kpi .d{font-size:11px; color:var(--muted); margin-top:3px;}
+  .kpi.ok .v{color:var(--green);}
+  .kpi.warn .v{color:var(--amber);}
+
+  .grid{display:grid; grid-template-columns:repeat(12,1fr); gap:18px;}
+  .panel{
+    background:linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0));
+    background-color:var(--panel); border:1px solid var(--panel-border);
+    border-radius:10px; padding:20px 22px; position:relative; overflow:hidden;
+  }
+  .panel::before{content:""; position:absolute; top:0; left:0; right:0; height:2px; background:var(--bar); opacity:.75;}
+  .panel.c-cyan{--bar:var(--cyan);} .panel.c-amber{--bar:var(--amber);}
+  .panel.c-violet{--bar:var(--violet);} .panel.c-rose{--bar:var(--rose);} .panel.c-green{--bar:var(--green);}
+
+  .panel-head{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px;}
+  .panel-title{font-size:14px; font-weight:600; letter-spacing:.01em;}
+  .panel-tag{font-family:var(--mono); font-size:10.5px; color:var(--muted); letter-spacing:.06em;}
+  .panel-sub{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin-bottom:14px;}
+
+  .span-6{grid-column:span 6;} .span-12{grid-column:span 12;}
+
+  .chart-box{position:relative; width:100%;}
+  .h-260{height:260px;} .h-220{height:220px;}
+
+  table{width:100%; border-collapse:collapse; font-family:var(--mono); font-size:11.5px;}
+  thead th{
+    text-align:right; font-weight:600; color:var(--muted); font-size:10px;
+    letter-spacing:.04em; text-transform:uppercase; padding:8px 10px;
+    border-bottom:1px solid var(--panel-border);
+    position:sticky; top:0; background:var(--panel);
+  }
+  thead th:first-child, thead th:nth-child(2){text-align:left;}
+  tbody td{padding:7px 10px; text-align:right; border-bottom:1px solid #171B26; color:var(--text);}
+  tbody td:first-child, tbody td:nth-child(2){text-align:left; color:var(--muted);}
+  tbody tr:hover{background:rgba(255,255,255,0.02);}
+  .badge{
+    display:inline-block; padding:2px 8px; border-radius:10px; font-size:10px;
+    font-family:var(--mono); letter-spacing:.03em;
+  }
+  .badge.ok{background:rgba(111,217,140,.12); color:var(--green); border:1px solid rgba(111,217,140,.3);}
+  .badge.warn{background:rgba(240,168,104,.12); color:var(--amber); border:1px solid rgba(240,168,104,.3);}
+  .badge.bad{background:rgba(240,112,138,.12); color:var(--rose); border:1px solid rgba(240,112,138,.3);}
+
+  .pager{display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:14px;
+    font-family:var(--mono); font-size:11.5px; color:var(--muted);}
+  .pager button{
+    border:1px solid var(--panel-border); background:var(--panel); border-radius:6px;
+    padding:5px 14px; font-family:var(--mono); font-size:11px; cursor:pointer; color:var(--text);
+    letter-spacing:.03em;
+  }
+  .pager button:hover:not(:disabled){border-color:var(--cyan); color:var(--cyan);}
+  .pager button:disabled{opacity:.35; cursor:default;}
+
+  footer{margin-top:30px; font-family:var(--mono); font-size:11px; color:var(--muted); text-align:center; letter-spacing:.03em;}
+
+  @media (max-width:1100px){ .kpi-strip{grid-template-columns:repeat(3,1fr);} }
+  @media (max-width:900px){ .span-6{grid-column:span 12;} body{padding:20px;} }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="brand-eyebrow">Inference Benchmark · Load Test Report</div>
+    <h1>LLM 推理服务测试指标看板</h1>
+  </div>
+  <div class="meta">
+    压测窗口 <span>2026-07-22 00:00 ~ 24:00</span><br>
+    样本量 <span>100 条请求（模拟数据）</span> · 生成时间 <span id="now"></span>
+  </div>
+</header>
+
+<div class="kpi-strip">
+  <div class="kpi"><div class="k">Input P50</div><div class="v">50K</div><div class="d">P90 160K · P99 380K · avg 80K</div></div>
+  <div class="kpi"><div class="k">Output P50</div><div class="v">0.2K</div><div class="d">P90 1.3K · P99 7K · avg 0.6K</div></div>
+  <div class="kpi ok"><div class="k">TTFT P50</div><div class="v">&lt; 4s</div><div class="d">首响时延 SLO</div></div>
+  <div class="kpi ok"><div class="k">TTFT P99</div><div class="v">&lt; 30s</div><div class="d">P75 &lt; 8s · P90 &lt; 12s</div></div>
+  <div class="kpi ok"><div class="k">TPOT P50</div><div class="v">&gt; 55 t/s</div><div class="d">单请求 decode 速度</div></div>
+  <div class="kpi ok"><div class="k">TPOT P99</div><div class="v">&gt; 25 t/s</div><div class="d">高峰 10-12 · 14-18</div></div>
+  <div class="kpi"><div class="k">Decode TPS</div><div class="v">≈ 70K t/s</div><div class="d">系统级吐字速率峰值 · avg ≈ 24K</div></div>
+</div>
+
+<div class="grid">
+
+  <!-- Input tokens 分位数 -->
+  <div class="panel c-cyan span-6">
+    <div class="panel-head">
+      <div class="panel-title">Input Tokens 分位数</div>
+      <div class="panel-tag">INPUT_TOKENS · PERCENTILE</div>
+    </div>
+    <div class="panel-sub">单位：K tokens ｜ P50=50K · avg=80K · P90=160K · P99=380K</div>
+    <div class="chart-box h-260"><canvas id="chartInput"></canvas></div>
+  </div>
+
+  <!-- Output tokens 分位数 -->
+  <div class="panel c-violet span-6">
+    <div class="panel-head">
+      <div class="panel-title">Output Tokens 分位数</div>
+      <div class="panel-tag">OUTPUT_TOKENS · PERCENTILE</div>
+    </div>
+    <div class="panel-sub">单位：K tokens ｜ P50=0.2K · avg=0.6K · P90=1.3K · P99=7K</div>
+    <div class="chart-box h-260"><canvas id="chartOutput"></canvas></div>
+  </div>
+
+  <!-- TTFT 分位数 -->
+  <div class="panel c-amber span-6">
+    <div class="panel-head">
+      <div class="panel-title">TTFT 首响时延分位数</div>
+      <div class="panel-tag">TTFT · PERCENTILE vs SLO</div>
+    </div>
+    <div class="panel-sub">单位：秒 ｜ 红色虚线为 SLO 上限（P50=4s / P75=8s / P90=12s / P99=30s）</div>
+    <div class="chart-box h-260"><canvas id="chartTTFT"></canvas></div>
+  </div>
+
+  <!-- TPOT 分位数 -->
+  <div class="panel c-rose span-6">
+    <div class="panel-head">
+      <div class="panel-title">TPOT Decode 速度分位数</div>
+      <div class="panel-tag">TPOT · PERCENTILE vs SLO</div>
+    </div>
+    <div class="panel-sub">单位：tokens/s ｜ 红色虚线为 SLO 下限（P50=55 / P99=25）</div>
+    <div class="chart-box h-260"><canvas id="chartTPOT"></canvas></div>
+  </div>
+
+  <!-- Decode TPS 系统级吐字速率 -->
+  <div class="panel c-green span-12">
+    <div class="panel-head">
+      <div class="panel-title">Decode TPS · 系统级吐字速率</div>
+      <div class="panel-tag">DECODE_TPS · 24H</div>
+    </div>
+    <div class="panel-sub">绿线：系统级 Decode 吐字速率 tok/s（左轴）≈ Decode 并发数 × TPOT 均值 ｜ 柱：Decode 并发请求数（右轴）</div>
+    <div class="chart-box h-220"><canvas id="chartDecodeTPS"></canvas></div>
+  </div>
+
+  <!-- 24h 流量分布 -->
+  <div class="panel c-amber span-12">
+    <div class="panel-head">
+      <div class="panel-title">全天流量分布（参考）</div>
+      <div class="panel-tag">QPS · 24H PROFILE</div>
+    </div>
+    <div class="panel-sub">高峰时段：10:00–12:00 · 14:00–18:00（底色区域），用于容量规划参考</div>
+    <div class="chart-box h-220"><canvas id="chartTraffic"></canvas></div>
+  </div>
+
+  <!-- 100 条明细表 -->
+  <div class="panel c-cyan span-12">
+    <div class="panel-head">
+      <div class="panel-title">请求明细（100 条模拟数据）</div>
+      <div class="panel-tag">RAW SAMPLES · 100 ROWS</div>
+    </div>
+    <div class="panel-sub">字段：request_id / time / input_tokens / output_tokens / ttft / tpot / total_latency / 状态，每页 20 条</div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>request_id</th><th>time</th>
+          <th>input_tokens</th><th>output_tokens</th>
+          <th>ttft (s)</th><th>tpot (tok/s)</th><th>total (s)</th><th>状态</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="pager">
+      <button id="prevBtn">← 上一页</button>
+      <span id="pageInfo"></span>
+      <button id="nextBtn">下一页 →</button>
+    </div>
+  </div>
+
+</div>
+
+<footer>INFERENCE BENCHMARK · 本页分布与明细均由页面内脚本按目标分位数实时模拟生成，可作为压测报告模板复用</footer>
+
+<script>
+document.getElementById('now').textContent = new Date().toLocaleString('zh-CN', {hour12:false});
+
+// ---------------------------------------------------------------
+// 1. 固定随机种子 + 模拟样本生成（100 条）
+// ---------------------------------------------------------------
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(20260723);
+function gaussian(){
+  let u=0,v=0;
+  while(u===0) u=rand();
+  while(v===0) v=rand();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
+function lognormal(mu, sigma){ return Math.exp(mu + sigma*gaussian()); }
+function clamp(x,lo,hi){ return Math.max(lo, Math.min(hi,x)); }
+
+const N = 100;
+const rows = [];
+// input tokens: 拟合 P50=50K, P90=160K, P99≈380K
+const IN_MU = Math.log(50000), IN_SIGMA = 0.907;
+// output tokens: 拟合 P50=0.2K, P90=1.3K, P99≈7K
+const OUT_MU = Math.log(200), OUT_SIGMA = 1.461;
+
+for(let i=0;i<N;i++){
+  // 时间按流量分布抽样：高峰 10-12、14-18 权重高
+  const r = rand();
+  let hour;
+  if (r < 0.28) hour = 10 + Math.floor(rand()*3);        // 10-12
+  else if (r < 0.72) hour = 14 + Math.floor(rand()*5);   // 14-18
+  else if (r < 0.82) hour = 8 + Math.floor(rand()*2);    // 8-9
+  else if (r < 0.92) hour = 19 + Math.floor(rand()*4);   // 19-22
+  else hour = Math.floor(rand()*8);                       // 0-7
+  const minute = Math.floor(rand()*60), second = Math.floor(rand()*60);
+
+  const inputTokens  = clamp(Math.round(lognormal(IN_MU, IN_SIGMA)), 500, 900000);
+  const outputTokens = clamp(Math.round(lognormal(OUT_MU, OUT_SIGMA)), 10, 16000);
+
+  // TTFT: 与 prefill 长度正相关 + 噪声（P50<4s / P75<8s / P90<12s / P99<30s）
+  const ttftBase = 0.4 + inputTokens/26000;
+  const ttft = +clamp(ttftBase * lognormal(0, 0.30), 0.15, 29.5).toFixed(2);
+
+  // TPOT: 中位数 ~57 tok/s（P50>55 / P99>25）
+  const tpot = +clamp(lognormal(4.05, 0.30), 18, 90).toFixed(1);
+
+  const total = +(ttft + outputTokens/tpot).toFixed(2);
+
+  let status = '成功';
+  if (ttft > 12 && rand() < 0.4) status = '慢请求';
+  if (rand() < 0.03) status = '超时';
+
+  rows.push({
+    idx: i + 1,
+    id: 'req_' + (100000 + i*37 + Math.floor(rand()*30)),
+    time: `2026-07-22 ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:${String(second).padStart(2,'0')}`,
+    inputTokens, outputTokens, ttft, tpot, total, status
+  });
+}
+rows.sort((a,b)=>a.time.localeCompare(b.time));
+rows.forEach((r,i)=> r.idx = i+1);
+
+// ---------------------------------------------------------------
+// 2. 表格渲染 + 分页（每页 20 条）
+// ---------------------------------------------------------------
+const pageSize = 20;
+let page = 0;
+const tbody = document.getElementById('tbody');
+const pageInfo = document.getElementById('pageInfo');
+const prevBtn = document.getElementById('prevBtn');
+const nextBtn = document.getElementById('nextBtn');
+
+function renderTable(){
+  const slice = rows.slice(page*pageSize, (page+1)*pageSize);
+  tbody.innerHTML = slice.map(r=>{
+    const badge = r.status==='成功' ? 'ok' : (r.status==='慢请求' ? 'warn' : 'bad');
+    return `<tr>
+      <td>${r.idx}</td>
+      <td>${r.id}</td>
+      <td>${r.time}</td>
+      <td>${r.inputTokens.toLocaleString()}</td>
+      <td>${r.outputTokens.toLocaleString()}</td>
+      <td>${r.ttft.toFixed(2)}</td>
+      <td>${r.tpot.toFixed(1)}</td>
+      <td>${r.total.toFixed(2)}</td>
+      <td><span class="badge ${badge}">${r.status}</span></td>
+    </tr>`;
+  }).join('');
+  const totalPages = Math.ceil(rows.length/pageSize);
+  pageInfo.textContent = `第 ${page+1} / ${totalPages} 页 · 共 ${rows.length} 条`;
+  prevBtn.disabled = page===0;
+  nextBtn.disabled = page===totalPages-1;
+}
+prevBtn.onclick = ()=>{ if(page>0){ page--; renderTable(); } };
+nextBtn.onclick = ()=>{ if(page<Math.ceil(rows.length/pageSize)-1){ page++; renderTable(); } };
+renderTable();
+
+// ---------------------------------------------------------------
+// 3. Chart.js 公共设置
+// ---------------------------------------------------------------
+if (window.ChartDataLabels) { Chart.register(ChartDataLabels); }
+Chart.defaults.font.family = "'IBM Plex Mono', monospace";
+Chart.defaults.color = '#7C8499';
+Chart.defaults.font.size = 11;
+Chart.defaults.set('plugins.datalabels', { display:false });
+const gridColor = '#1E2330';
+const commonScales = (extra={}) => ({
+  x:{ grid:{color:gridColor, drawTicks:false}, border:{color:'#232838'} },
+  y:{ grid:{color:gridColor, drawTicks:false}, border:{color:'#232838'}, beginAtZero:true, ...extra }
+});
+function barGradient(ctx, top, bottom, h=260){
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0, top); g.addColorStop(1, bottom);
+  return g;
+}
+
+// ---------------------------------------------------------------
+// 4. Input Tokens 分位数
+// ---------------------------------------------------------------
+new Chart(document.getElementById('chartInput'), {
+  type:'bar',
+  data:{
+    labels:['P50','AVG','P90','P99'],
+    datasets:[{
+      data:[50, 80, 160, 380],
+      backgroundColor: c=>barGradient(c.chart.ctx,'rgba(79,216,196,0.9)','rgba(79,216,196,0.2)'),
+      borderRadius:4, borderSkipped:false, maxBarThickness:52
+    }]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{display:false},
+      tooltip:{callbacks:{label:i=>` ${i.formattedValue}K tokens`}},
+      datalabels:{ display:true, anchor:'end', align:'top', offset:2, color:'#9FA6B8', font:{size:10}, formatter:v=>v+'K' }
+    },
+    scales: commonScales({title:{display:true,text:'K tokens',color:'#7C8499',font:{size:10}}})
+  }
+});
+
+// ---------------------------------------------------------------
+// 5. Output Tokens 分位数
+// ---------------------------------------------------------------
+new Chart(document.getElementById('chartOutput'), {
+  type:'bar',
+  data:{
+    labels:['P50','AVG','P90','P99'],
+    datasets:[{
+      data:[0.2, 0.6, 1.3, 7],
+      backgroundColor: c=>barGradient(c.chart.ctx,'rgba(154,140,255,0.9)','rgba(154,140,255,0.2)'),
+      borderRadius:4, borderSkipped:false, maxBarThickness:52
+    }]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{display:false},
+      tooltip:{callbacks:{label:i=>` ${i.formattedValue}K tokens`}},
+      datalabels:{ display:true, anchor:'end', align:'top', offset:2, color:'#9FA6B8', font:{size:10}, formatter:v=>v+'K' }
+    },
+    scales: commonScales({title:{display:true,text:'K tokens',color:'#7C8499',font:{size:10}}})
+  }
+});
+
+// ---------------------------------------------------------------
+// 6. TTFT 分位数 vs SLO
+// ---------------------------------------------------------------
+new Chart(document.getElementById('chartTTFT'), {
+  type:'bar',
+  data:{
+    labels:['P50','P75','P90','P99'],
+    datasets:[
+      {
+        label:'实测值',
+        data:[3.6, 7.2, 11.4, 27.8],
+        backgroundColor: c=>barGradient(c.chart.ctx,'rgba(240,168,104,0.9)','rgba(240,168,104,0.2)'),
+        borderRadius:4, borderSkipped:false, maxBarThickness:44
+      },
+      {
+        label:'SLO 上限',
+        data:[4, 8, 12, 30],
+        type:'line',
+        borderColor:'#F0708A', borderDash:[6,4], borderWidth:1.5,
+        pointRadius:3, pointBackgroundColor:'#F0708A', fill:false
+      }
+    ]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{display:true, position:'top', align:'end', labels:{boxWidth:10, boxHeight:10, padding:12}},
+      tooltip:{callbacks:{label:i=>` ${i.dataset.label}: ${i.formattedValue}s`}},
+      datalabels:{
+        display:c=>c.datasetIndex===0, anchor:'end', align:'top', offset:2,
+        color:'#9FA6B8', font:{size:10}, formatter:v=>v+'s'
+      }
+    },
+    scales: commonScales({title:{display:true,text:'秒 (s)',color:'#7C8499',font:{size:10}}})
+  }
+});
+
+// ---------------------------------------------------------------
+// 7. TPOT 分位数 vs SLO
+// ---------------------------------------------------------------
+new Chart(document.getElementById('chartTPOT'), {
+  type:'bar',
+  data:{
+    labels:['P50','P75','P90','P99'],
+    datasets:[
+      {
+        label:'实测值',
+        data:[58, 47, 36, 28],
+        backgroundColor: c=>barGradient(c.chart.ctx,'rgba(240,112,138,0.9)','rgba(240,112,138,0.2)'),
+        borderRadius:4, borderSkipped:false, maxBarThickness:44
+      },
+      {
+        label:'SLO 下限',
+        data:[55, null, null, 25],
+        type:'line',
+        borderColor:'#F0708A', borderDash:[6,4], borderWidth:1.5,
+        pointRadius:3, pointBackgroundColor:'#F0708A', fill:false, spanGaps:true
+      }
+    ]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{display:true, position:'top', align:'end', labels:{boxWidth:10, boxHeight:10, padding:12}},
+      tooltip:{callbacks:{label:i=>` ${i.dataset.label}: ${i.formattedValue} tok/s`}},
+      datalabels:{
+        display:c=>c.datasetIndex===0, anchor:'end', align:'top', offset:2,
+        color:'#9FA6B8', font:{size:10}, formatter:v=>v+''
+      }
+    },
+    scales: commonScales({title:{display:true,text:'tokens/s',color:'#7C8499',font:{size:10}}})
+  }
+});
+
+// ---------------------------------------------------------------
+// 8. Decode TPS · 系统级吐字速率（并发 × TPOT 均值 ≈ 57 t/s）
+// ---------------------------------------------------------------
+const hours = Array.from({length:24},(_,i)=>`${String(i).padStart(2,'0')}:00`);
+const r2 = mulberry32(99);
+const trafficBase = [4,3,2,2,3,5,9,18,38,66,92,100,88,55,82,95,98,90,78,52,38,26,16,8];
+const traffic = trafficBase.map(v=>Math.round(v*(0.92+r2()*0.16)));
+// Little's law：decode 并发 ≈ QPS × 平均 decode 时长(≈600 tok / 57 t/s ≈ 10.5s)
+const r3 = mulberry32(2026);
+const decodeConc = traffic.map(v=>Math.round(v*10.5*(0.9+r3()*0.2)));
+const decodeTPS  = decodeConc.map(c=>Math.round(c*57));
+
+new Chart(document.getElementById('chartDecodeTPS'), {
+  type:'bar',
+  data:{
+    labels:hours,
+    datasets:[
+      {
+        type:'bar',
+        label:'Decode 并发数',
+        data:decodeConc,
+        backgroundColor:'rgba(111,217,140,0.18)',
+        borderColor:'rgba(111,217,140,0.4)',
+        borderWidth:1, borderRadius:3, maxBarThickness:26,
+        yAxisID:'y1'
+      },
+      {
+        type:'line',
+        label:'Decode TPS (tok/s)',
+        data:decodeTPS, fill:false, tension:.35,
+        borderColor:'#6FD98C', pointRadius:3, pointHoverRadius:5,
+        pointBackgroundColor:'#6FD98C', borderWidth:2.5,
+        yAxisID:'y'
+      }
+    ]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{display:true, position:'top', align:'end', labels:{boxWidth:10, boxHeight:10, padding:12}},
+      tooltip:{mode:'index', intersect:false},
+      datalabels:{display:false}
+    },
+    scales:{
+      x:{ grid:{color:gridColor, drawTicks:false}, border:{color:'#232838'} },
+      y:{ grid:{color:gridColor, drawTicks:false}, border:{color:'#232838'}, beginAtZero:true,
+          title:{display:true,text:'tok/s',color:'#7C8499',font:{size:10}},
+          ticks:{callback:v=> (v/1000)+'K'} },
+      y1:{ position:'right', beginAtZero:true, grid:{drawOnChartArea:false}, border:{color:'#232838'},
+           title:{display:true,text:'并发数',color:'#7C8499',font:{size:10}} }
+    }
+  },
+  plugins:[{
+    id:'peakBandsTps',
+    beforeDraw(chart){
+      const {ctx, chartArea:{top,bottom}, scales:{x}} = chart;
+      [[10,12],[14,18]].forEach(([s,e])=>{
+        const x1=x.getPixelForValue(s), x2=x.getPixelForValue(e);
+        ctx.save(); ctx.fillStyle='rgba(111,217,140,0.06)'; ctx.fillRect(x1,top,x2-x1,bottom-top); ctx.restore();
+      });
+    }
+  }]
+});
+
+// ---------------------------------------------------------------
+// 9. 24h 流量分布（高峰时段底色标注）
+// ---------------------------------------------------------------
+new Chart(document.getElementById('chartTraffic'), {
+  type:'line',
+  data:{
+    labels:hours,
+    datasets:[{
+      label:'QPS',
+      data:traffic, fill:true, tension:.35,
+      borderColor:'#F0A868', backgroundColor:'rgba(240,168,104,0.12)',
+      pointRadius:3, pointHoverRadius:5, pointBackgroundColor:'#F0A868',
+      borderWidth:2.5
+    }]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{display:false},
+      tooltip:{mode:'index', intersect:false, callbacks:{label:i=>` ${i.formattedValue} QPS`}},
+      datalabels:{
+        display:true, align:'top', offset:6, color:'#F0A868', font:{size:9},
+        formatter:(v,ctx)=> ctx.dataIndex%2===0 ? v : ''
+      }
+    },
+    scales: commonScales({title:{display:true,text:'QPS',color:'#7C8499',font:{size:10}}})
+  },
+  plugins:[{
+    id:'peakBands',
+    beforeDraw(chart){
+      const {ctx, chartArea:{top,bottom}, scales:{x}} = chart;
+      [[10,12],[14,18]].forEach(([s,e])=>{
+        const x1=x.getPixelForValue(s), x2=x.getPixelForValue(e);
+        ctx.save(); ctx.fillStyle='rgba(240,168,104,0.08)'; ctx.fillRect(x1,top,x2-x1,bottom-top); ctx.restore();
+      });
+    }
+  }]
+});
+</script>
+
+</body>
+</html>

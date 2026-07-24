@@ -138,20 +138,18 @@
       }
     },
     {
-      "id": "TC-09",
-      "name": "缓存命中 TPM",
+      "id": "TC-10",
+      "name": "分输入输出档位性能",
       "type": "性能",
-      "input": "预热后并发 {{concurrency}} 请求，相同 system prompt（~5k tokens）+ 不同 user 后缀",
-      "expected": "cached_tokens > 0，命中率 > 50%，缓存下 TPM 有效",
-      "method": "cache_hit",
+      "input": "混合分布模式(默认100条): 输入(in)p50=50k/p90=160k/p99=380k(avg=80k), 输出(out)p50=0.2k/p90=1.3k/p99=7k(avg=0.6k)，按分位数线性插值生成每条请求的 in/out 长度",
+      "expected": "100条请求均成功下发，输出整体 TTFT p50/p90/p99、Decode TPS p50/p99、TPOT p50/p99、ITL max p99 分位数对照 SLA",
+      "method": "io_mix_benchmark",
       "params": {
-        "concurrency": 10,
-        "total_requests": 30,
-        "max_tokens": 50,
-        "system_prompt_tokens": 5000,
-        "messages": [
-          {"role": "user", "content": "Based on the context provided, summarize the key points in 3-5 bullet points. Keep each bullet under 15 words."}
-        ]
+        "concurrency": 100,
+        "total_requests": 100,
+        "max_output": 8192,
+        "in_anchors": [[0.0, 2000], [0.5, 50000], [0.9, 160000], [0.99, 380000], [1.0, 380000]],
+        "out_anchors": [[0.0, 50], [0.5, 200], [0.9, 1300], [0.99, 7000], [1.0, 7000]]
       }
     }
   ]
