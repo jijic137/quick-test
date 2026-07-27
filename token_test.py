@@ -139,7 +139,7 @@ def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None)
     ]
 
 
-def _gen_context_padding(target_tokens: int, chars_per_token: float = 4.0) -> str:
+def _gen_context_padding(target_tokens: int, chars_per_token: float = 4.8) -> str:
     """生成约 target_tokens 长的英文 padding 文本，用于上下文窗口测试。
 
     英文 ~4 chars/token，用 _BENCH_BASE_TEXT 重复填充，估算比中文"测"准确得多。
@@ -432,6 +432,12 @@ def parse_args():
         type=_parse_token_count,
         default=10000,
         help="朴素扫描模式步长（支持 k/m 后缀）。默认 10k。例: 5k, 20k",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="从断点文件续跑（朴素扫描模式中断后恢复）。传入 checkpoint JSON 路径。",
     )
     parser.add_argument(
         "--naive-io-tier",
@@ -886,7 +892,7 @@ def probe_context_limit(cfg: dict, params: dict) -> dict:
     """
     api = cfg["api"]
     target = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
-    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.0)
+    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.8)
     timeout = cfg.get("context_test", {}).get("timeout") or max(api.get("timeout", 60), 120)
     prompt_template = params.get(
         "prompt_template",
@@ -1030,7 +1036,7 @@ def build_cfg(args) -> dict:
         },
         "context_test": {
             "target_tokens": target_list,
-            "chars_per_token_estimate": ctx_defaults.get("chars_per_token_estimate", 4.0),
+            "chars_per_token_estimate": ctx_defaults.get("chars_per_token_estimate", 4.8),
             "timeout": ctx_defaults.get("timeout"),
         },
     }
@@ -1214,7 +1220,7 @@ def test_context_limit(cfg: dict, case: dict, probe_mode: bool = False,
         raw_target if isinstance(raw_target, list) else [raw_target],
         reverse=True,
     )
-    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.0)
+    chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.8)
     timeout = cfg.get("context_test", {}).get("timeout") or max(api.get("timeout", 60), 120)
 
     # ── 渐进式探测模式（使用最大目标值）──
@@ -2001,6 +2007,27 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# TC-10: 断点保存
+# ---------------------------------------------------------------------------
+def _save_checkpoint(path: str, sweep: list, reps: int, results: list, completed: list):
+    """保存朴素扫描断点（JSON 格式）。"""
+    ck = {
+        "updated_at": datetime.now(TZ_BJ).strftime("%Y-%m-%d %H:%M:%S"),
+        "repetitions": reps,
+        "total_steps": len(sweep),
+        "sweep_snapshot": [{"seq": s["seq"], "input_tokens": s["input_tokens"],
+                            "output_tokens": s["output_tokens"], "tier": s.get("tier", "?")}
+                           for s in sweep],
+        "completed_steps": sorted(completed),
+        "raw_results": results,
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ck, f, ensure_ascii=False, default=str)
+    os.replace(tmp, path)  # 原子替换
+
+
+# ---------------------------------------------------------------------------
 # TC-10: 分输入输出档位性能测试
 # ---------------------------------------------------------------------------
 
@@ -2035,6 +2062,31 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
     timeout = api.get("timeout", 120)
     max_out = int(params.get("max_output", 8192))
     reps_original = int(params.get("repetitions", 1))
+    resume_path = params.get("resume", "")
+
+    # ── 断点续跑：加载已完成步骤 ──
+    checkpoint_path = resume_path
+    completed_steps = set()
+    saved_raw_results = []
+    if resume_path:
+        try:
+            with open(resume_path, "r", encoding="utf-8") as f:
+                ck = json.load(f)
+            saved_raw_results = ck.get("raw_results", [])
+            completed_steps = set(ck.get("completed_steps", []))
+            print(f"         [断点续跑] 加载 {len(saved_raw_results)} 条已保存结果, "
+                  f"已完成 {len(completed_steps)}/{len(sweep)} 步, 从第 {max(completed_steps or [0]) + 1} 步继续")
+        except Exception as e:
+            print(f"         [WARN] 无法读取断点文件 {resume_path}: {e}, 从头开始")
+    if not checkpoint_path:
+        ts = datetime.now(TZ_BJ).strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = str(RESULTS_DIR / f"tc10_checkpoint_{ts}.json")
+        print(f"         [断点] 结果将实时保存到: {checkpoint_path}")
+        # 写入初始 checkpoint 文件
+        _save_checkpoint(checkpoint_path, sweep, reps_original, [], [])
+
+    # 如果有续跑数据，替换 raw_results（后面聚合时合并）
+    raw_results = list(saved_raw_results)
     total_steps = len(sweep)
     # reps=1: 串行; reps>1: 每步 N 条全并发
     if reps_original > 1:
@@ -2051,14 +2103,17 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
     print(f"         [朴素扫描] {total_steps} 步, 输入 {sweep[0]['input_tokens']//1000}K→"
           f"{sweep[-1]['input_tokens']//1000}K, 步长 10K, {mode_label}")
 
-    # ── 构建所有请求任务列表 ──
-    # 每条任务: (unique_step_index, repetition_index, seq_label)
+    # ── 构建所有请求任务列表（跳过已完成步骤）──
     tasks = []
+    active_steps = set()
     for step in sweep:
         in_tok = step["input_tokens"]
         out_tok = min(step["output_tokens"], max_out)
         tier_label = step.get("tier", "?")
         seq = step["seq"]
+        if seq in completed_steps:
+            continue  # 续跑：跳过已完成
+        active_steps.add(seq)
         for rep in range(actual_reps):
             tasks.append({
                 "step_seq": seq,
@@ -2120,6 +2175,9 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
         for task in tasks:
             raw_results.append(_do_one(task))
             seq = task["step_seq"]
+            completed_steps.add(seq)
+            # 每步完成后保存断点
+            _save_checkpoint(checkpoint_path, sweep, reps_original, raw_results, completed_steps)
             if True:  # 每条打印
                 pct = seq * 100 // total_steps
                 last = raw_results[-1]
@@ -2148,6 +2206,9 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
                 for f in as_completed(futures):
                     raw_results.append(f.result())
             step_elapsed = round(time.perf_counter() - t_step, 2)
+            completed_steps.add(seq)
+            # 每步完成后保存断点
+            _save_checkpoint(checkpoint_path, sweep, reps_original, raw_results, completed_steps)
             # 本步摘要
             step_recs = [r for r in raw_results if r["step_seq"] == seq and r["status"] == "ok"]
             fail_n = n - len(step_recs)
@@ -4237,6 +4298,7 @@ def main():
                 "sweep": sweep,
                 "repetitions": rep,  # 1=串行, N>1=每步N条并发
                 "max_output": args.io_max_context or 8192,
+                "resume": args.resume,
             }
             method = "io_sweep_benchmark"
             if rep > 1:
