@@ -167,7 +167,7 @@ def _error_category(error_msg: str, status_code: int = None) -> str:
         return "请求超时"
     if error_msg and error_msg.startswith("连接失败"):
         return "连接失败"
-    if error_msg.startswith("未收到任何 token"):
+    if error_msg and error_msg.startswith("未收到任何 token"):
         return "流式无输出"
     if status_code and status_code >= 400:
         return f"HTTP {status_code}"
@@ -192,30 +192,6 @@ def _chunk_keys(chunk: dict) -> dict:
             info[k] = f"[{len(v)}]"
         else:
             info[k] = type(v).__name__
-    return info
-
-
-
-def _error_category(error_msg: str, status_code: int = None) -> str:
-    if error_msg == "请求超时": return "请求超时"
-    if error_msg and error_msg.startswith("连接失败"): return "连接失败"
-    if error_msg.startswith("未收到任何 token"): return "流式无输出"
-    if status_code and status_code >= 400: return f"HTTP {status_code}"
-    if status_code and status_code < 400 and error_msg: return f"HTTP {status_code}: {error_msg[:40]}"
-    if error_msg: return error_msg[:60]
-    return "未知错误"
-
-
-def _chunk_keys(chunk: dict) -> dict:
-    info = {}
-    for k, v in chunk.items():
-        if k == "choices" and isinstance(v, list) and v:
-            delta = v[0].get("delta", {}) if isinstance(v[0], dict) else {}
-            info["choices[0].delta"] = list(delta.keys()) if delta else "(empty)"
-            info["choices[0].finish_reason"] = v[0].get("finish_reason") if isinstance(v[0], dict) else None
-        elif isinstance(v, dict): info[k] = list(v.keys())
-        elif isinstance(v, list): info[k] = f"[{len(v)}]"
-        else: info[k] = type(v).__name__
     return info
 
 def _percentiles(data: list, *ps) -> dict:
@@ -386,8 +362,8 @@ def parse_args():
     parser.add_argument(
         "--g-max",
         type=int,
-        default=None,
-        help="梯度测试最大并发数 (默认: 取 -c 的值)",
+        default=1000,
+        help="梯度测试最大并发数 (默认: 1000)",
     )
     parser.add_argument(
         "--max-workers",
@@ -1043,7 +1019,7 @@ def build_cfg(args) -> dict:
             "gradient": {
                 "start": args.g_start,
                 "step": args.g_step,
-                "max": args.g_max or args.concurrency,
+                "max": args.g_max,
             },
         },
         "context_test": {
@@ -1163,7 +1139,7 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
 
     g_start = gradient["start"]
     g_step = gradient["step"]
-    g_max = gradient["max"]
+    g_max = max(gradient["max"], g_start)
     levels = []
 
     print(f"         [梯度] {g_start} → {g_max} (步长 {g_step})")
@@ -1178,7 +1154,10 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
     total_ok = sum(l["ok"] for l in levels)
     total_fail = sum(l["fail"] for l in levels)
     total_tokens_all = sum(l["total_tokens"] for l in levels)
-    best = max(levels, key=lambda l: float(l["tps_tokens"]))
+    if levels:
+        best = max(levels, key=lambda l: float(l["tps_tokens"]))
+    else:
+        best = {"tps_tokens": "0", "tpm_tokens": "0", "decode_tps": "0", "decode_tpm": "0"}
     passed = total_ok > 0
 
     return {"case_id": case["id"], "passed": passed,
@@ -2183,7 +2162,7 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
 
     # ── 执行 ──
     t_start = time.perf_counter()
-    raw_results = []
+    # raw_results 已包含续跑加载的旧数据，这里直接追加新结果
 
     if not is_concurrent:
         # 串行模式
@@ -2325,10 +2304,12 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
         "detail": {
             "mode": "io_sweep",
             "repetitions": reps_original,
+            "concurrency": reps_original if is_concurrent else 1,
             "total_steps": total_steps,
             "total_requests": total_requests,
             "ok": ok_count,
             "fail": fail_count,
+            "passed_count": f"{ok_count}/{total_steps}",
             "elapsed": elapsed,
             "sweep": records,
             "tier_stats": tier_stats,

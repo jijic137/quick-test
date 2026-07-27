@@ -138,6 +138,23 @@
       }
     },
     {
+      "id": "TC-09",
+      "name": "缓存命中",
+      "type": "性能",
+      "input": "先发 1 条预热填充前缀缓存，再发 N 条并发请求（相同 system prompt，不同 user suffix），测量缓存命中率 + 缓存下 TPM",
+      "expected": "有缓存命中（cached_tokens > 0）且请求成功",
+      "method": "cache_hit",
+      "params": {
+        "concurrency": 50,
+        "total_requests": 800,
+        "max_tokens": 50,
+        "system_prompt_tokens": 5000,
+        "messages": [
+          {"role": "user", "content": "Please summarize the system prompt in one sentence."}
+        ]
+      }
+    },
+    {
       "id": "TC-10",
       "name": "分输入输出档位性能",
       "type": "性能",
