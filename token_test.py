@@ -423,9 +423,10 @@ def parse_args():
     )
     parser.add_argument(
         "--resume",
-        type=str,
+        nargs="?",
+        const="__auto__",
         default="",
-        help="从断点文件续跑（朴素扫描模式中断后恢复）。传入 checkpoint JSON 路径。",
+        help="从断点续跑。不传路径则自动找 results/ 下最新 checkpoint。",
     )
     parser.add_argument(
         "--naive-io-tier",
@@ -2000,6 +2001,30 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
 # ---------------------------------------------------------------------------
 # TC-10: 断点保存
 # ---------------------------------------------------------------------------
+def _find_latest_checkpoint(results_dir: Path, model: str, host: str = "") -> str:
+    """查找 results/ 下最新的 checkpoint 文件，按修改时间排序。
+    文件名匹配模式: {model}-{host}-checkpoint_*.json
+    """
+    pattern = f"{model}-{host}-checkpoint_*.json"
+    files = sorted(results_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(files[0]) if files else ""
+
+
+def _save_global_checkpoint(path: str, results: list, model: str = "", host: str = ""):
+    """保存全局测试断点（JSON 格式，每完成一个 TC 调用一次）。"""
+    ck = {
+        "updated_at": datetime.now(TZ_BJ).strftime("%Y-%m-%d %H:%M:%S"),
+        "model": model,
+        "host": host,
+        "completed_count": len(results),
+        "results": results,
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ck, f, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
+
+
 def _save_checkpoint(path: str, sweep: list, reps: int, results: list, completed: list):
     """保存朴素扫描断点（JSON 格式）。"""
     ck = {
@@ -4246,6 +4271,40 @@ def main():
     args = parse_args()
     cfg = build_cfg(args)
 
+    # ── --resume 自动查找 + 提前加载 ──
+    from urllib.parse import urlparse
+    _m = cfg["api"].get("model", "unknown").replace("/", "-").replace("\\", "-")
+    _h = urlparse(cfg["api"]["url"]).hostname or "unknown"
+    if args.resume == "__auto__":
+        args.resume = _find_latest_checkpoint(RESULTS_DIR, _m, _h)
+        if args.resume:
+            print(f"[INFO] --resume 自动找到: {args.resume}\n")
+
+    # 提前加载断点（dispatch 需要知道 sweep_resume_path）
+    completed_results = {}
+    sweep_resume_path = ""
+    if args.resume:
+        try:
+            with open(args.resume, "r", encoding="utf-8") as f:
+                ck = json.load(f)
+            if "results" in ck:
+                for r in ck["results"]:
+                    completed_results[r["case_id"]] = r
+                # 关联朴素扫描断点
+                sweep_ck = _find_latest_checkpoint(RESULTS_DIR, _m, _h)
+                if sweep_ck and sweep_ck != args.resume:
+                    try:
+                        with open(sweep_ck, "r", encoding="utf-8") as f2:
+                            ck2 = json.load(f2)
+                        if "sweep_snapshot" in ck2:
+                            sweep_resume_path = sweep_ck
+                    except Exception:
+                        pass
+            elif "sweep_snapshot" in ck:
+                sweep_resume_path = args.resume
+        except Exception as e:
+            print(f"[WARN] 无法读取断点 {args.resume}: {e}\n")
+
     print("=" * 60)
     print("  Token 接口快速测试工具")
     print("=" * 60)
@@ -4294,7 +4353,7 @@ def main():
                 "sweep": sweep,
                 "repetitions": rep,  # 1=串行, N>1=每步N条并发
                 "max_output": args.io_max_context or 8192,
-                "resume": args.resume,
+                "resume": sweep_resume_path or args.resume,
             }
             method = "io_sweep_benchmark"
             if rep > 1:
@@ -4391,7 +4450,32 @@ def main():
 
     print("\n[RUN] 开始执行测试用例...\n")
 
+    # ── 全局断点续跑 ──
+    ts = datetime.now(TZ_BJ).strftime("%Y%m%d_%H%M%S")
+    if args.resume:
+        global_ck_path = args.resume
+        if completed_results:
+            print(f"[INFO] 全局断点: {len(completed_results)} 条已完成用例")
+        if sweep_resume_path:
+            ck2 = json.loads(Path(sweep_resume_path).read_text("utf-8"))
+            print(f"[INFO]   关联朴素扫描断点: {len(ck2.get('completed_steps',[]))} 步已完成")
+        print()
+    else:
+        global_ck_path = str(RESULTS_DIR / f"{_m}-{_h}-checkpoint_{ts}.json")
+        print(f"[INFO] 断点文件: {global_ck_path}\n")
+
     for i, case in enumerate(cases, 1):
+        cid = case["id"]
+
+        # 续跑：跳过已完成用例
+        if cid in completed_results:
+            results.append(completed_results[cid])
+            prev_results[cid] = completed_results[cid]
+            status = "[PASS]" if completed_results[cid].get("passed") else "[FAIL]"
+            print(f"  [{i}/{len(cases)}] {cid} {case['name']} ... SKIP (已完成) {status}")
+            continue
+
+        # 朴素扫描内部有自己更细粒度的断点（每步保存），全局断点只在整 TC 完成后保存
         cid = case["id"]
         method_name = case.get("method", "")
         print(f"  [{i}/{len(cases)}] {cid} {case['name']} ... ", end="", flush=True)
@@ -4412,6 +4496,8 @@ def main():
 
             results.append(result)
             prev_results[cid] = result
+            # 每完成一个用例就保存全局断点
+            _save_global_checkpoint(global_ck_path, results, _m, _h)
             status = "[PASS]" if result["passed"] else "[FAIL]"
             print(status)
 
@@ -4442,6 +4528,7 @@ def main():
             }
             results.append(error_result)
             prev_results[cid] = error_result
+            _save_global_checkpoint(global_ck_path, results, _m, _h)
 
     # 输出汇总
     print("\n" + "=" * 60)
