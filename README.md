@@ -15,9 +15,9 @@ python token_test.py \
   -m gpt-4o
 
 # 3. 查看结果
-#    仪表盘: reports/20260723_150000/test_report_20260723_150000.html  ← 浏览器打开
-#    详情:   results/test_output_20260723_150000.csv
-#    MD:     reports/20260723_150000/test_report_20260723_150000.md
+#    仪表盘: result_md/20260723_150000/<模型>-<IP>-<时间>.html  ← 浏览器打开
+#    详情:   results/<模型>-<IP>-<时间>.csv
+#    MD:     result_md/20260723_150000/<模型>-<IP>-<时间>.md
 #    汇总:   test_summary.csv  （累积对比，每次追加一行）
 ```
 
@@ -63,11 +63,26 @@ python token_test.py
 | `--g-step` | 并发步长 | 200 |
 | `--g-max` | 最大并发数 | 取 `-c` 的值 |
 
+### 用例筛选
+
+| 参数 | 说明 |
+|---|---|
+| `--tc-filter` | 仅运行指定用例，逗号分隔。例: `TC-01,TC-02,TC-08` |
+| `--tc-exclude` | 跳过指定用例，逗号分隔。例: `TC-04,TC-06`。可与 `--tc-filter` 联用 |
+
+```bash
+# 只跑 TC-01 和 TC-08
+python token_test.py --tc-filter TC-01,TC-08 ...
+
+# 除 TC-04、TC-06 外全跑
+python token_test.py --tc-exclude TC-04,TC-06 ...
+```
+
 ### 输出路径
 
 | 参数 | 简写 | 说明 | 默认值 |
 |---|---|---|---|
-| `--output` | `-o` | 详情 CSV 路径 | 自动生成时间戳文件名 |
+| `--output` | `-o` | 详情 CSV 路径 | 自动生成：`results/{模型}-{IP}-{时间戳}.csv` |
 | `--summary` | | 累积汇总 CSV 路径 | test_summary.csv |
 | `--cases` | | 用例 JSON 路径 | test_cases.json |
 
@@ -77,30 +92,42 @@ python token_test.py
 |---|---|
 | `--io-benchmark` | 独立开关：仅运行 TC-10，忽略其他用例 |
 | `--io-tiers` | 自定义档位，格式 `in:out` 逗号分隔。例: `1k:300,8k:1000,32k:2000` |
-| `--io-concurrency` | 并发数（混合分布模式统一并发；朴素模式默认全并发，=1 串行，>1 每步×N） |
+| `--io-concurrency` | 并发数（混合分布模式统一并发；朴素模式默认串行，N>1 每步×N 按步依次并发） |
 | `--io-requests` | 总请求数（混合分布默认 100；朴素模式默认 38 步） |
-| `--io-max-context` | 最大上下文上限（超出的输入跳过不测），支持 k/m 后缀 |
-| `--naive-io-tier` | 朴素扫描模式：10K→380K 步长 10K，输出按档位固定。默认全并发 38 步同时发出 |
+| `--io-max-context` | 最大上下文上限。混合分布：超出跳过；朴素扫描：决定扫描终点（默认 380K） |
+| `--io-step` | 朴素扫描步长（支持 k/m 后缀）。默认 10k。例: `5k`, `20k` |
+| `--naive-io-tier` | 朴素扫描模式：10K→上限 步长 10K，输出按档位固定。默认串行 |
+| `--resume` | 从断点文件续跑。传入 checkpoint JSON 路径，自动跳过已完成步骤 |
 
 ### TC-10 朴素扫描模式详解
 
 ```
-输入:  10K  20K  30K  ...  380K  （步长 10K，共 38 步）
+输入:  10K  20K  30K  ...  上限（--io-max-context 指定，默认 380K）
 输出:  0.2K (≤50K) | 0.6K (60~80K) | 1.3K (90~160K) | 7K (>160K)
+步长:  默认 10K，--io-step 可调
 ```
 
 三种执行方式：
 
 ```bash
-# 全并发（默认）：38 步同时发出，测并发争抢下的性能衰减曲线
+# 串行（默认）：逐条发出，测纯输入→性能曲线
 python token_test.py --io-benchmark --naive-io-tier
 
-# 串行：逐条发出，测纯输入→性能曲线（无并发干扰）
-python token_test.py --io-benchmark --naive-io-tier --io-concurrency 1
+# 串行 + 自定义步长和上限
+python token_test.py --io-benchmark --naive-io-tier --io-step 5k --io-max-context 700k
 
-# 并发×N：每步重复 N 条并发取均值 + 标准差（38×N 条同时发出）
-python token_test.py --io-benchmark --naive-io-tier --io-concurrency 5
+# 并发×N：每步 N 条同时发出取均值 ± 标准差，不同步串行依次执行
+python token_test.py --io-benchmark --naive-io-tier --io-concurrency 10
 ```
+
+**断点续跑**：朴素扫描自动保存 checkpoint（`results/{模型}-{IP}-checkpoint_{时间}.json`），每步完成后原子写入。中断后：
+
+```bash
+python token_test.py --io-benchmark --naive-io-tier \
+  --resume results/hy3-192.168.1.1-checkpoint_20260727_150000.json
+```
+
+已完成的步骤自动跳过，raw_results 直接合并，最终聚合新旧数据一起算。
 
 ## 测试用例
 
@@ -125,22 +152,23 @@ python token_test.py --io-benchmark --naive-io-tier --io-concurrency 5
 |---|---|---|---|
 | 混合分布 | `io_mix_benchmark` | `--io-benchmark`（默认） | 按 P50/P90/P99 锚点线性插值生成 N 条 (in, out) 请求，并发执行 |
 | 分档位 | `io_tier_benchmark` | `--io-benchmark --io-tiers 1k:300,8k:1000` | 自定义多个固定 (in, out) 档位，每档独立并发 |
-| 朴素扫描 | `io_sweep_benchmark` | `--io-benchmark --naive-io-tier` | 输入 10K→380K 步长 10K，输出按档位固定，全并发/串行可选 |
+| 朴素扫描 | `io_sweep_benchmark` | `--io-benchmark --naive-io-tier` | 输入从步长值开始递增至上限，输出按档位固定。支持断点续跑 |
 
 ## 输出文件
 
-每次运行生成以下文件：
+每次运行生成以下文件（文件名格式：`{模型名}-{IP}-{时间戳}.{后缀}`，文件夹名保持纯时间戳）：
 
 ```
-reports/20260723_150000/
-├── test_report_20260723_150000.md     ← Markdown 验收报告
-├── test_report_20260723_150000.html   ← Chart.js 深色仪表盘（浏览器打开）
-└── test_report_20260723_150000.pdf    ← PDF 导出（自动，需 Chrome/Edge）
+result_md/20260723_150000/
+├── hy3-36.150.116.130-20260723_150000.md     ← Markdown 验收报告
+├── hy3-36.150.116.130-20260723_150000.html   ← Chart.js 深色仪表盘（浏览器打开）
+└── hy3-36.150.116.130-20260723_150000.pdf    ← PDF 导出（自动，需 Chrome/Edge）
 
 results/
-└── test_output_20260723_150000.csv    ← 详情 CSV（每次独立文件）
+├── hy3-36.150.116.130-20260723_150000.csv    ← 详情 CSV（每次独立文件）
+└── hy3-36.150.116.130-checkpoint_20260723_150000.json  ← 朴素扫描断点
 
-test_summary.csv                       ← 累积汇总（每次追加一行）
+test_summary.csv                               ← 累积汇总（每次追加一行）
 ```
 
 ### HTML 仪表盘
@@ -178,7 +206,9 @@ test_summary.csv                       ← 累积汇总（每次追加一行）
 
 ## 流式性能指标说明
 
-流式请求（TC-08、TC-10）使用 `api_request_stream()` 采集逐 token 时间戳，计算以下指标：
+流式请求使用 `api_request_stream()` 采集逐 token 时间戳，计算以下指标。
+
+支持标准 `delta.content` 以及思考模型（如 GLM）的 `delta.reasoning` 字段。TTFT 输出含 `⚠️` 标记表示 streaming 解析兜底（次优但真实的测量值）。
 
 | 指标 | 公式 | 单位 | 说明 |
 |---|---|---|---|
@@ -212,12 +242,13 @@ quick-test/
 ├── test_cases.json                    ← 测试用例持久化定义
 ├── test_summary.csv                   ← 累积汇总（每次追加一行）
 ├── results/
-│   └── test_output_*.csv              ← 各次运行详情 CSV
-└── reports/
+│   ├── {模型}-{IP}-{时间}.csv          ← 各次运行详情 CSV
+│   └── {模型}-{IP}-checkpoint_*.json  ← 朴素扫描断点
+└── result_md/
     └── YYYYMMDD_HHMMSS/
-        ├── test_report_*.md           ← Markdown 报告
-        ├── test_report_*.html         ← Chart.js 仪表盘
-        └── test_report_*.pdf          ← PDF 导出
+        ├── {模型}-{IP}-{时间}.md       ← Markdown 报告
+        ├── {模型}-{IP}-{时间}.html     ← Chart.js 仪表盘
+        └── {模型}-{IP}-{时间}.pdf      ← PDF 导出
 ```
 
 ## 可复现性
@@ -226,6 +257,7 @@ quick-test/
 - 配置通过 `test_config.json` 或命令行传入，相同输入 → 相同流程
 - 每次运行生成独立时间戳目录，历史结果不丢失
 - 汇总 CSV 累积所有运行记录，支持跨版本对比
+- 朴素扫描每步自动保存断点，支持中断后续跑
 
 ## 自定义用例
 
@@ -262,6 +294,34 @@ quick-test/
 | `io_tier_benchmark` | TC-10 分档位模式 |
 | `io_mix_benchmark` | TC-10 混合分布模式 |
 | `io_sweep_benchmark` | TC-10 朴素扫描模式 |
+
+## 配置项说明
+
+`test_config.json` 中可配置的完整字段：
+
+```json
+{
+  "api": {
+    "url": "https://your-api.example.com/v1/chat/completions",
+    "key": "sk-...",
+    "model": "your-model",
+    "timeout": 120
+  },
+  "benchmark": {
+    "concurrency": 4,
+    "total_requests": 20,
+    "input_tokens": 1000
+  },
+  "context_test": {
+    "target_tokens": [512000, 256000, 128000],
+    "chunk_size": 4000,
+    "chars_per_token_estimate": 4.8,
+    "timeout": 900
+  }
+}
+```
+
+`chars_per_token_estimate` 默认值 4.8（英文 ~4.8 chars/token，用于上下文 padding 估算）。
 
 ## License
 

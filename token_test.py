@@ -336,6 +336,18 @@ def parse_args():
         help=f"累积汇总 CSV 路径，每次运行追加一行 (默认: {SUMMARY_PATH.name})",
     )
     parser.add_argument(
+        "--tc-filter",
+        type=str,
+        default="",
+        help="仅运行指定用例，逗号分隔。例: TC-01,TC-02,TC-08。不传则运行全部。",
+    )
+    parser.add_argument(
+        "--tc-exclude",
+        type=str,
+        default="",
+        help="跳过指定用例，逗号分隔。例: TC-04,TC-06。可与 --tc-filter 联用。",
+    )
+    parser.add_argument(
         "--cases",
         type=Path,
         default=CASES_PATH,
@@ -2080,7 +2092,10 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
             print(f"         [WARN] 无法读取断点文件 {resume_path}: {e}, 从头开始")
     if not checkpoint_path:
         ts = datetime.now(TZ_BJ).strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = str(RESULTS_DIR / f"tc10_checkpoint_{ts}.json")
+        from urllib.parse import urlparse
+        m = api.get("model", "unknown").replace("/", "-").replace("\\", "-")
+        h = urlparse(api["url"]).hostname or "unknown"
+        checkpoint_path = str(RESULTS_DIR / f"{m}-{h}-checkpoint_{ts}.json")
         print(f"         [断点] 结果将实时保存到: {checkpoint_path}")
         # 写入初始 checkpoint 文件
         _save_checkpoint(checkpoint_path, sweep, reps_original, [], [])
@@ -4353,6 +4368,20 @@ def main():
                 print(f"\n[INFO] --naive-io-tier 已启用，TC-10: {sweep_label}\n")
                 break
 
+    # ── TC 过滤：--tc-filter TC-01,TC-08 / --tc-exclude TC-04,TC-06 ──
+    if args.tc_filter:
+        wanted = set(f.strip() for f in args.tc_filter.split(",") if f.strip())
+        before = len(cases)
+        cases = [c for c in cases if c["id"] in wanted]
+        print(f"[INFO] --tc-filter={args.tc_filter}, 筛选 {before}→{len(cases)} 条用例")
+    if args.tc_exclude:
+        excluded = set(f.strip() for f in args.tc_exclude.split(",") if f.strip())
+        before = len(cases)
+        cases = [c for c in cases if c["id"] not in excluded]
+        print(f"[INFO] --tc-exclude={args.tc_exclude}, 排除后 {before}→{len(cases)} 条用例")
+    if args.tc_filter or args.tc_exclude:
+        print()
+
     # 检查 Key
     key = cfg["api"].get("key", "")
     if not key or key == "sk-your-api-key-here":
@@ -4440,15 +4469,19 @@ def main():
     print(f"  总计: {len(results)} | 通过: {passed} | 失败: {failed}")
     print("=" * 60 + "\n")
 
-    # ── 生成时间戳文件名 ──
+    # ── 生成时间戳 + 文件名前缀（模型名-IP-时间）──
     test_time = datetime.now(TZ_BJ).strftime("%Y-%m-%d %H:%M:%S")
     timestamp = datetime.now(TZ_BJ).strftime("%Y%m%d_%H%M%S")
+    from urllib.parse import urlparse
+    model = cfg["api"].get("model", "unknown").replace("/", "-").replace("\\", "-")
+    host = urlparse(cfg["api"]["url"]).hostname or "unknown"
+    name_prefix = f"{model}-{host}-{timestamp}"
 
     # 确保输出目录存在
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.output is None:
-        detail_output = RESULTS_DIR / f"test_output_{timestamp}.csv"
+        detail_output = RESULTS_DIR / f"{name_prefix}.csv"
     else:
         detail_output = args.output
 
@@ -4461,9 +4494,9 @@ def main():
     # ── 验收报告（MD + HTML + PDF）──
     report_dir = RESULTS_MD_DIR / timestamp
     report_dir.mkdir(parents=True, exist_ok=True)
-    md_path = report_dir / f"test_report_{timestamp}.md"
-    html_path = report_dir / f"test_report_{timestamp}.html"
-    pdf_path = report_dir / f"test_report_{timestamp}.pdf"
+    md_path = report_dir / f"{name_prefix}.md"
+    html_path = report_dir / f"{name_prefix}.html"
+    pdf_path = report_dir / f"{name_prefix}.pdf"
 
     write_markdown_report(results, cases, cfg, args, md_path, test_time)
     write_html_report(results, cases, cfg, args, html_path, test_time)
