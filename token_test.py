@@ -443,6 +443,36 @@ def parse_args():
     return parser.parse_args(_preprocess_argv())
 
 
+def _generate_default_config(path: Path):
+    """首次运行时生成默认配置文件模板。"""
+    template = {
+        "_comment": "填写你的接口信息。此文件包含 API Key，请勿上传到 Git。",
+        "api": {
+            "url": "https://your-api.example.com/v1/chat/completions",
+            "key": "sk-your-api-key-here",
+            "model": "your-model-name",
+            "timeout": 1200,
+        },
+        "benchmark": {
+            "concurrency": 50,
+            "total_requests": 800,
+            "input_tokens": 1000,
+            "_comment": "concurrency/total_requests: 默认并发数和总请求数。input_tokens: 默认输入 token 数（支持 1k/8k/50k）。",
+        },
+        "context_test": {
+            "target_tokens": [512000, 256000, 128000],
+            "chunk_size": 4000,
+            "chars_per_token_estimate": 4.8,
+            "timeout": 900,
+            "_comment": "target_tokens: 上下文验收档位列表。chars_per_token_estimate: 每 token 估算字符数。",
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(template, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] 已生成默认配置文件: {path}")
+    print(f"       请编辑 URL、Key、Model 后重新运行。\n")
+
+
 def _load_config_defaults() -> dict:
     """从 test_config.json 加载默认值，文件不存在则返回内置默认值。"""
     builtin = {
@@ -882,7 +912,8 @@ def probe_context_limit(cfg: dict, params: dict) -> dict:
     api = cfg["api"]
     target = cfg.get("context_test", {}).get("target_tokens", params.get("target_tokens", 512000))
     chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.8)
-    timeout = cfg.get("context_test", {}).get("timeout") or max(api.get("timeout", 60), 120)
+    ctx_timeout = cfg.get("context_test", {}).get("timeout") or 0
+    timeout = max(ctx_timeout, api.get("timeout", 60), 120)
     prompt_template = params.get(
         "prompt_template",
         "请总结以下文本的开头3个字和结尾3个字，用英文回复: {padding}"
@@ -1213,7 +1244,8 @@ def test_context_limit(cfg: dict, case: dict, probe_mode: bool = False,
         reverse=True,
     )
     chars_per_token = cfg.get("context_test", {}).get("chars_per_token_estimate", 4.8)
-    timeout = cfg.get("context_test", {}).get("timeout") or max(api.get("timeout", 60), 120)
+    ctx_timeout = cfg.get("context_test", {}).get("timeout") or 0
+    timeout = max(ctx_timeout, api.get("timeout", 60), 120)
 
     # ── 渐进式探测模式（使用最大目标值）──
     if probe_mode:
@@ -4269,6 +4301,11 @@ def append_summary_csv(results: list, cfg: dict, output_path: Path, test_time: s
 
 def main():
     args = parse_args()
+
+    # ── 首次运行：生成默认配置文件 ──
+    if not CONFIG_PATH.exists():
+        _generate_default_config(CONFIG_PATH)
+
     cfg = build_cfg(args)
 
     # ── --resume 自动查找 + 提前加载 ──
