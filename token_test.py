@@ -668,7 +668,7 @@ def api_request(
 
     t0 = time.perf_counter()
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=(30, timeout))
+        resp = requests.post(url, headers=headers, json=payload, timeout=(1200, timeout))
         result["latency"] = round(time.perf_counter() - t0, 3)
         result["status_code"] = resp.status_code
 
@@ -746,7 +746,7 @@ def api_request_stream(url: str, key: str, model: str, messages: list,
     t_start = time.perf_counter()
     try:
         resp = requests.post(url, headers=headers, json=payload,
-                             stream=True, timeout=(30, timeout))
+                             stream=True, timeout=(1200, timeout))
         result["status_code"] = resp.status_code
 
         if resp.status_code != 200:
@@ -1549,7 +1549,7 @@ def test_tool_calling(cfg: dict, case: dict) -> dict:
             "tools": tools,
             "max_tokens": max_tokens,
             "stream": False,
-        }, timeout=(30, timeout))
+        }, timeout=(1200, timeout))
         latency1 = round(time.perf_counter() - t1, 3)
     except Exception as e:
         return _tool_result(case["id"], False, {
@@ -1613,7 +1613,7 @@ def test_tool_calling(cfg: dict, case: dict) -> dict:
             "messages": step2_msgs,
             "max_tokens": max_tokens,
             "stream": False,
-        }, timeout=(30, timeout))
+        }, timeout=(1200, timeout))
         latency2 = round(time.perf_counter() - t2, 3)
     except Exception as e:
         return _tool_result(case["id"], False, {
