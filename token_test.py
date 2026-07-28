@@ -562,7 +562,7 @@ def _build_naive_sweep(args, max_context=None) -> tuple:
     step_size = getattr(args, 'io_step', 10000) or 10000
     input_start = step_size  # 起始值 = 步长
     input_step = step_size
-    input_max = (max_context - 7000) if max_context else 380000  # 预留输出空间
+    input_max = max_context if max_context else 380000
 
     # 档位输出映射: (input_upper_bound, output_tokens, label)
     tier_map = [
