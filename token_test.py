@@ -429,6 +429,12 @@ def parse_args():
         help="从断点续跑。不传路径则自动找 results/ 下最新 checkpoint。",
     )
     parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        default=False,
+        help="使用非流式请求（默认: 流式）。非流式模式下 TTFT/TPOT/ITL 等流式专属指标不可用。",
+    )
+    parser.add_argument(
         "--naive-io-tier",
         action="store_true",
         default=False,
@@ -860,6 +866,41 @@ def api_request_stream(url: str, key: str, model: str, messages: list,
     return result
 
 
+def _api_request_auto(url: str, key: str, model: str, messages: list,
+                        max_tokens: int = 300, timeout: int = 120,
+                        stream: bool = True) -> dict:
+    """根据 stream 参数自动选择流式或非流式请求，返回统一的流式结构。
+
+    非流式模式下将 api_request 的结果归一化到 api_request_stream 的返回结构，
+    使得下游指标计算公式无需修改：
+      - ttft=0 → decode_tps 退化为整体 TPS (completion / total_latency)
+      - token_times=[] → ITL/TPOT 相关指标为 0
+      - cached_tokens=0 → 缓存命中率不可用
+    """
+    if stream:
+        return api_request_stream(url, key, model, messages, max_tokens, timeout)
+    r = api_request(url, key, model, messages, max_tokens, timeout, stream=False)
+    if r["ok"] and r.get("usage"):
+        lat = r.get("latency", 0)
+        comp = r["usage"].get("completion", 0)
+        prompt = r["usage"].get("prompt", 0)
+        total = r["usage"].get("total", 0)
+        return {
+            "ok": True, "status_code": r.get("status_code"),
+            "ttft": 0.0, "total_latency": lat,
+            "token_times": [],
+            "completion_tokens": comp, "prompt_tokens": prompt, "total_tokens": total,
+            "cached_tokens": 0, "error": None,
+        }
+    return {
+        "ok": False, "status_code": r.get("status_code"),
+        "ttft": 0.0, "total_latency": r.get("latency", 0),
+        "token_times": [],
+        "completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0,
+        "cached_tokens": 0, "error": r.get("error"),
+    }
+
+
 def query_model_info(url: str, key: str, model: str, timeout: int = 30) -> dict:
     """
     查询 /v1/models 获取模型声明的上下文长度等信息。
@@ -1037,6 +1078,7 @@ def build_cfg(args) -> dict:
         target_list = [args.context_tokens]
 
     return {
+        "stream": not args.no_stream,
         "api": {
             "url": args.url,
             "key": args.key,
@@ -1108,9 +1150,9 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
         def _worker(_idx):
             varied_msgs = [dict(m) for m in messages]
             varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
-            r = api_request_stream(url=api["url"], key=api["key"], model=api["model"],
-                                    messages=varied_msgs, max_tokens=max_tokens,
-                                    timeout=timeout)
+            r = _api_request_auto(url=api["url"], key=api["key"], model=api["model"],
+                                   messages=varied_msgs, max_tokens=max_tokens,
+                                   timeout=timeout, stream=cfg.get("stream", True))
             with _stats_lock:
                 if r["ok"]:
                     stats["ok"] += 1
@@ -1668,6 +1710,13 @@ def _tool_result(cid: str, passed: bool, detail: dict) -> dict:
 
 def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
     """流式请求，分别统计 prefill/decode 阶段指标 + 百分位 + ITL 检查 + 缓存追踪。"""
+    if not cfg.get("stream", True):
+        return {
+            "case_id": case["id"],
+            "passed": True,
+            "skipped": True,
+            "detail": {"reason": "TC-08 流式性能测试，非流式模式下跳过"},
+        }
     api = cfg["api"]
     params = case.get("params", {})
     concurrency = params.get("concurrency", 5)
@@ -1702,10 +1751,11 @@ def test_streaming_benchmark(cfg: dict, case: dict) -> dict:
     def _worker(_idx):
         varied_msgs = [dict(m) for m in messages]
         varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
-        r = api_request_stream(
+        r = _api_request_auto(
             url=api["url"], key=api["key"], model=api["model"],
             messages=varied_msgs, max_tokens=max_tokens,
             timeout=api.get("timeout", 120),
+            stream=cfg.get("stream", True),
         )
         with _stats_lock:
             if r["ok"]:
@@ -1918,9 +1968,10 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
         {"role": "system", "content": system_text},
         {"role": "user", "content": base_user},
     ]
-    warm = api_request_stream(
+    warm = _api_request_auto(
         url=api["url"], key=api["key"], model=api["model"],
         messages=messages_warm, max_tokens=max_tokens, timeout=timeout,
+        stream=cfg.get("stream", True),
     )
 
     # ── 并发压测 ──
@@ -1944,9 +1995,10 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
             {"role": "system", "content": system_text},
             {"role": "user", "content": varied_user},
         ]
-        r = api_request_stream(
+        r = _api_request_auto(
             url=api["url"], key=api["key"], model=api["model"],
             messages=varied_msgs, max_tokens=max_tokens, timeout=timeout,
+            stream=cfg.get("stream", True),
         )
         with _stats_lock:
             if r["ok"]:
@@ -1985,12 +2037,18 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
     warm_ttft = warm.get("ttft", 0)
     ttft_reduction = round((warm_ttft - ttft_avg) / warm_ttft * 100, 1) if warm_ttft > 0 else 0
 
-    if cache_hit:
+    is_stream = cfg.get("stream", True)
+    if cache_hit and is_stream:
         verdict = (
             f"缓存命中率={cache_hit_rate}%, "
             f"TPM={tpm:.0f} tok/min, "
             f"TTFT cold={warm_ttft}s→avg={ttft_avg}s "
             f"(降{ttft_reduction}%), "
+            f"成功{stats['ok']}/{stats['total']}"
+        )
+    elif not is_stream:
+        verdict = (
+            f"[非流式] TPM={tpm:.0f} tok/min, "
             f"成功{stats['ok']}/{stats['total']}"
         )
     else:
@@ -2002,7 +2060,7 @@ def test_cache_hit(cfg: dict, case: dict) -> dict:
 
     return {
         "case_id": case["id"],
-        "passed": stats["ok"] > 0 and cache_hit,
+        "passed": stats["ok"] > 0 and (cache_hit if is_stream else True),
             "reliable": (stats["ok"] / total * 100 >= 50) if total else False,
         "detail": {
             "reliable": (stats["ok"] / total * 100 >= 50) if total else False,
@@ -2187,9 +2245,10 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
         ))
         varied = [dict(m) for m in messages]
         varied[-1]["content"] += f"\n\n[sweep:{task['label']}]"
-        r = api_request_stream(
+        r = _api_request_auto(
             url=api["url"], key=api["key"], model=api["model"],
             messages=varied, max_tokens=out_tok, timeout=timeout,
+            stream=cfg.get("stream", True),
         )
         ttft_method = r.get("ttft_method", "")
         rec = {
@@ -2451,9 +2510,10 @@ def test_io_tier_benchmark(cfg: dict, case: dict) -> dict:
         def _worker(_idx):
             varied = [dict(m) for m in messages]
             varied[-1]["content"] += f"\n\n[req:{_idx}]"
-            r = api_request_stream(
+            r = _api_request_auto(
                 url=api["url"], key=api["key"], model=api["model"],
                 messages=varied, max_tokens=out_tok, timeout=timeout,
+                stream=cfg.get("stream", True),
             )
             with _stats_lock:
                 if r["ok"]:
@@ -2650,9 +2710,10 @@ def test_io_mix_benchmark(cfg: dict, case: dict) -> dict:
         ))
         varied = [dict(m) for m in messages]
         varied[-1]["content"] += f"\n\n[req:{req['seq']}]"
-        r = api_request_stream(
+        r = _api_request_auto(
             url=api["url"], key=api["key"], model=api["model"],
             messages=varied, max_tokens=out_tok, timeout=timeout,
+            stream=cfg.get("stream", True),
         )
         rec = {
             "seq": req["seq"], "input_tokens": in_tok, "output_tokens": out_tok,
@@ -3037,9 +3098,11 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
     sr = f"{tc / len(results) * 100:.1f}%" if results else "N/A"
     cn = "全部通过" if fc == 0 else f"{fc}/{len(results)} 未通过"
     cmd = "python token_test.py " + " ".join(f'"{a}"' if " " in a else a for a in sys.argv[1:])
+    stream_mode = cfg.get("stream", True)
 
     lines = []
-    lines.append(f"# Token 接口测试报告 — {test_time} — {'✅' if fc==0 else '❌'}{cn}")
+    mode_tag = "" if stream_mode else " [非流式]"
+    lines.append(f"# Token 接口测试报告{mode_tag} — {test_time} — {'✅' if fc==0 else '❌'}{cn}")
     lines.append(f"```bash\n{cmd}\n```")
     plat = getattr(args, 'platform', '')
     plat_str = f" | **平台**：{plat}" if plat else ""
@@ -3096,11 +3159,14 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
         elif cid == "TC-07":
             lines.append(f"{'✅' if p else '❌'}{d.get('tool_name') or 'N/A'}|HTTP{d.get('status_code')}|{d.get('latency','N/A')}s|{d.get('verdict','')[:120]}\n")
         elif cid == "TC-08":
-            w = " ⚠️成功率<50%不可靠" if not d.get("reliable", True) else ""
-            lines.append(f"ok={d.get('ok')}fail={d.get('fail')}|{d.get('elapsed')}s|入={d.get('total_prompt_tokens','N/A')}出={d.get('total_completion_tokens','N/A')}tok|TTFT avg={d.get('ttft_avg')}s P99={d.get('ttft_p99')}s|Decode={d.get('decode_tps')}tok/s|TPOT={d.get('tpot_avg_ms')}ms{w}")
-            ec = d.get("error_counts", {})
-            if ec: lines.append(f"失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}")
-            lines.append("")
+            if r.get("skipped"):
+                lines.append(f"⏭ 已跳过（{r.get('detail',{}).get('reason','非流式模式')}）\n")
+            else:
+                w = " ⚠️成功率<50%不可靠" if not d.get("reliable", True) else ""
+                lines.append(f"ok={d.get('ok')}fail={d.get('fail')}|{d.get('elapsed')}s|入={d.get('total_prompt_tokens','N/A')}出={d.get('total_completion_tokens','N/A')}tok|TTFT avg={d.get('ttft_avg')}s P99={d.get('ttft_p99')}s|Decode={d.get('decode_tps')}tok/s|TPOT={d.get('tpot_avg_ms')}ms{w}")
+                ec = d.get("error_counts", {})
+                if ec: lines.append(f"失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}")
+                lines.append("")
         elif cid == "TC-09":
             w = " ⚠️成功率<50%不可靠" if not d.get("reliable", True) else ""
             wu = d.get("warmup", {}) or {}
@@ -3152,7 +3218,7 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
     print(f"[OK] Markdown 报告已写入: {output_path}")
 
 
-def write_html_report(results, cases, cfg, args, output_path, test_time, model_info=None):
+def write_html_report(results, cases, cfg, args, output_path, test_time, model_info=None, stream_mode=True):
     """生成深色主题 Chart.js 仪表盘 HTML 报告，直接从 results 数据渲染。"""
     api = cfg["api"]
     rm = {r["case_id"]: r for r in results}
@@ -3401,7 +3467,7 @@ footer{{margin-top:30px; font-family:var(--mono); font-size:11px; color:var(--mu
 <header>
   <div>
     <div class="brand-eyebrow">Inference Benchmark · Load Test Report</div>
-    <h1>LLM 推理服务测试指标看板</h1>
+    <h1>LLM 推理服务测试指标看板 <span style="font-size:14px;color:var(--muted);">[{'流式' if stream_mode else '非流式'}]</span></h1>
   </div>
   <div class="meta">
     测试时间 <span>{test_time}</span><br>
@@ -4092,7 +4158,7 @@ def write_pdf_report(html_path, pdf_path):
 # 累积汇总 CSV — 每次运行追加一行，便于对比历史
 # ---------------------------------------------------------------------------
 SUMMARY_COLUMNS = [
-    "模型名", "测试时间", "梯度并发范围", "梯度步长", "输入Tokens",
+    "模型名", "测试时间", "请求模式", "梯度并发范围", "梯度步长", "输入Tokens",
     "TPS (tok/s)", "TPM (tok/min)", "Decode TPS", "Decode TPM", "请求成功率",
     "Token 总数", "平均延迟 (s)",
     "TTFT-avg(s)", "TTFT-p99(s)", "TPOT-avg(ms)", "Decode (tok/s)",
@@ -4145,7 +4211,9 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
     case_status = {}
     for r in results:
         cid = r.get("case_id", "?")
-        if r.get("passed"):
+        if r.get("skipped"):
+            case_status[cid] = "跳过"
+        elif r.get("passed"):
             detail = r.get("detail", {})
             if cid == "TC-04" and detail.get("mode") == "multi_tier":
                 case_status[cid] = f"通过({detail.get('passed_count', '?')})"
@@ -4169,6 +4237,10 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
             reason = str(reason)[:80].replace("\n", " ").replace(",", "，")
             case_status[cid] = f"失败: {reason}"
 
+    # ── 请求模式 ──
+    stream_mode = cfg.get("stream", True)
+    stream_mode_s = "流式" if stream_mode else "非流式"
+
     # ── 提取流式性能指标（精简版：TTFT-avg, TTFT-p99, TPOT-avg, Decode）──
     ttft_avg_s = "N/A"
     ttft_p99_s = "N/A"
@@ -4178,12 +4250,15 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
 
     for r in results:
         if r.get("case_id") == "TC-08" and r.get("detail"):
-            d = r["detail"]
-            ttft_avg_s = str(d.get("ttft_avg", "N/A"))
-            ttft_p99_s = str(d.get("ttft_p99", "N/A"))
-            tpot_avg_s = str(d.get("tpot_avg_ms", "N/A"))
-            decode_tps_s = str(d.get("decode_tps", "N/A"))
-            cache_rate_s = str(d.get("cache_hit_rate", "N/A"))
+            if r.get("skipped"):
+                ttft_avg_s = ttft_p99_s = tpot_avg_s = decode_tps_s = "(跳过)"
+            else:
+                d = r["detail"]
+                ttft_avg_s = str(d.get("ttft_avg", "N/A"))
+                ttft_p99_s = str(d.get("ttft_p99", "N/A"))
+                tpot_avg_s = str(d.get("tpot_avg_ms", "N/A"))
+                decode_tps_s = str(d.get("decode_tps", "N/A"))
+                cache_rate_s = str(d.get("cache_hit_rate", "N/A"))
 
     # ── 如果 TC-09 有缓存命中率，优先用 TC-09 的 ──
     for r in results:
@@ -4194,6 +4269,7 @@ def _build_summary_row(results: list, cfg: dict, test_time: str) -> list:
     return [
         cfg["api"].get("model", ""),
         test_time,
+        stream_mode_s,
         f"{cfg.get('benchmark', {}).get('gradient', {}).get('start', '')}→{cfg.get('benchmark', {}).get('gradient', {}).get('max', '')}",
         str(cfg.get("benchmark", {}).get("gradient", {}).get("step", "")),
         str(cfg.get("benchmark", {}).get("input_tokens", "")),
@@ -4354,6 +4430,7 @@ def main():
     print(f"  梯度并发: {grad.get('start', '?')} → {grad.get('max', '?')} (步长 {grad.get('step', '?')})")
     print(f"  输入 tokens: {cfg['benchmark'].get('input_tokens', 1000)}")
     print(f"  上下文阈值: {cfg['context_test']['target_tokens']} tokens")
+    print(f"  请求模式:   {'流式 (SSE)' if cfg.get('stream', True) else '非流式'}")
     if args.probe_context:
         print(f"  上下文模式: 渐进式探测")
     print()
@@ -4606,7 +4683,8 @@ def main():
     pdf_path = report_dir / f"{name_prefix}.pdf"
 
     write_markdown_report(results, cases, cfg, args, md_path, test_time)
-    write_html_report(results, cases, cfg, args, html_path, test_time)
+    write_html_report(results, cases, cfg, args, html_path, test_time,
+                      stream_mode=cfg.get("stream", True))
     try:
         write_pdf_report(str(html_path.resolve()), str(pdf_path))
     except Exception as e:
