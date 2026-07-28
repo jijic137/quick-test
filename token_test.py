@@ -2887,21 +2887,21 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                     lvs = detail.get("levels", [])
                     best_c = detail.get("best_concurrency", "?")
                     actual = (f"梯度{lvs[0]['concurrency']}→{lvs[-1]['concurrency']}({len(lvs)}级), "
-                              f"最高TPS={detail.get("tps_tokens")}tok/s(并发={best_c}), "
-                              f"Decode={detail.get("decode_tps")}tok/s, "
-                              f"总成功/失败={detail.get("ok")}/{detail.get("fail")}")
+                              f"最高TPS={detail.get('tps_tokens')}tok/s(并发={best_c}), "
+                              f"Decode={detail.get('decode_tps')}tok/s, "
+                              f"总成功/失败={detail.get('ok')}/{detail.get('fail')}")
                 else:
                     actual = (
-                        f"成功{detail.get("ok")}/{detail.get("ok",0)+detail.get("fail",0)}, "
-                        f"TPS={detail.get("tps_tokens")}tok/s, "
-                        f"TPM={detail.get("tpm_tokens")}tok/min, "
-                        f"Decode={detail.get("decode_tps","N/A")}tok/s, "
-                        f"平均延迟{detail.get("avg_latency")}s"
+                        f"成功{detail.get('ok')}/{detail.get('ok',0)+detail.get('fail',0)}, "
+                        f"TPS={detail.get('tps_tokens')}tok/s, "
+                        f"TPM={detail.get('tpm_tokens')}tok/min, "
+                        f"Decode={detail.get('decode_tps','N/A')}tok/s, "
+                        f"平均延迟{detail.get('avg_latency')}s"
                     )
                     ec = detail.get("error_counts", {})
                     if ec:
                         parts = [f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:3]]
-                        actual += f", 失败:{", ".join(parts)}"
+                        actual += f", 失败:{', '.join(parts)}"
             elif cid == "TC-03":
                 actual = (
                     f"TPS={detail.get('tps')}, TPM={detail.get('tpm')}, "
