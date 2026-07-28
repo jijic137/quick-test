@@ -2052,6 +2052,7 @@ def _save_global_checkpoint(path: str, results: list, model: str = "", host: str
         "results": results,
     }
     tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(ck, f, ensure_ascii=False, default=str)
     os.replace(tmp, path)
@@ -2070,6 +2071,7 @@ def _save_checkpoint(path: str, sweep: list, reps: int, results: list, completed
         "raw_results": results,
     }
     tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(ck, f, ensure_ascii=False, default=str)
     os.replace(tmp, path)  # 原子替换
