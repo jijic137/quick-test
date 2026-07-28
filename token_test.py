@@ -2886,7 +2886,7 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 if detail.get("mode") == "gradient":
                     lvs = detail.get("levels", [])
                     best_c = detail.get("best_concurrency", "?")
-                    actual = (f"梯度{lvs[0]["concurrency"]}→{lvs[-1]["concurrency"]}({len(lvs)}级), "
+                    actual = (f"梯度{lvs[0]['concurrency']}→{lvs[-1]['concurrency']}({len(lvs)}级), "
                               f"最高TPS={detail.get("tps_tokens")}tok/s(并发={best_c}), "
                               f"Decode={detail.get("decode_tps")}tok/s, "
                               f"总成功/失败={detail.get("ok")}/{detail.get("fail")}")
