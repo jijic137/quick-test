@@ -155,6 +155,33 @@
       }
     },
     {
+      "id": "TC-11",
+      "name": "固定IO并发梯度",
+      "type": "性能",
+      "input": "固定输入50K/输出0.2K，并发梯度 100→1000 步长200，测量 TTFT/TPOT/Decode TPS 随并发变化",
+      "expected": "各并发级别均成功，输出 TTFT/TPOT/Decode TPS 梯度数据",
+      "method": "fixed_io_concurrency_sweep",
+      "params": {
+        "input_tokens": 50000,
+        "max_tokens": 200
+      }
+    },
+    {
+      "id": "TC-12",
+      "name": "正态分布混合IO性能",
+      "type": "性能",
+      "input": "对数正态分布拟合(离散) + 输入输出相关(ρ=0.8)，in: P50=50K P90=160K P99=380K AVG=80K, out: P50=0.2K P90=1.3K P99=7K AVG=0.6K",
+      "expected": "200条请求均成功下发，输出 TTFT/Decode TPS/TPOT/ITL 分位数对照 SLA",
+      "method": "normal_dist_io_benchmark",
+      "params": {
+        "total_requests": 200,
+        "concurrency": 100,
+        "correlation": 0.8,
+        "in_target": {"p50": 50000, "p90": 160000, "p99": 380000, "avg": 80000},
+        "out_target": {"p50": 200, "p90": 1300, "p99": 7000, "avg": 600}
+      }
+    },
+    {
       "id": "TC-10",
       "name": "分输入输出档位性能",
       "type": "性能",

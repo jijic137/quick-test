@@ -43,6 +43,12 @@ except ImportError:
     print("[ERROR] 缺少 requests 库，请运行: python -m pip install requests")
     sys.exit(1)
 
+try:
+    import tiktoken
+    _TIKENC = tiktoken.get_encoding("cl100k_base")  # GPT-4/3.5 默认编码
+except ImportError:
+    _TIKENC = None
+
 # ── 路径常量 ────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).resolve().parent
 CONFIG_PATH   = BASE_DIR / "test_config.json"
@@ -107,10 +113,44 @@ _BENCH_BASE_TEXT = (
 _GEN_BENCH_SYSTEM = {}  # 缓存不同长度的 system prompt
 
 
+def _count_tokens(text: str) -> int:
+    """精确计算 token 数。有 tiktoken 用 tiktoken，否则 fallback ~4 chars/token。"""
+    if _TIKENC is not None:
+        return len(_TIKENC.encode(text))
+    return len(text) // 4
+
+
+def _gen_text_for_tokens(target_tokens: int) -> str:
+    """生成恰好约 target_tokens 个 token 的英文文本。
+
+    使用 tiktoken 精确计数，通过重复 _BENCH_BASE_TEXT 并截断到目标 token 数。
+    无 tiktoken 时 fallback 到字符估算。
+    """
+    if _TIKENC is None:
+        needed_chars = target_tokens * 4
+        repeats = max(1, needed_chars // len(_BENCH_BASE_TEXT) + 1)
+        return (_BENCH_BASE_TEXT * repeats)[:needed_chars]
+
+    # 先用重复文本生成足够长的文本
+    base_tokens = len(_TIKENC.encode(_BENCH_BASE_TEXT))
+    repeats = max(1, target_tokens * 2 // base_tokens + 2)
+    raw = _BENCH_BASE_TEXT * repeats
+
+    # 逐步截断到目标 token 数
+    tokens = _TIKENC.encode(raw)
+    if len(tokens) >= target_tokens:
+        return _TIKENC.decode(tokens[:target_tokens])
+
+    # 不够长则继续填充
+    while len(tokens) < target_tokens:
+        raw += _BENCH_BASE_TEXT
+        tokens = _TIKENC.encode(raw)
+    return _TIKENC.decode(tokens[:target_tokens])
+
+
 def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None):
     """生成指定输入长度的 messages，用于压测和流式测试。
     system prompt 填充到 (target_input_tokens - user_tokens) 左右。
-    返回 (messages, estimated_input_tokens)。
     """
     if user_question is None:
         user_question = (
@@ -118,8 +158,7 @@ def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None)
             "summary covering the most important concepts across all sections. Include "
             "specific technical details and best practices. Write about 250-300 words."
         )
-    user_tokens = max(50, len(user_question.split()) * 3 // 2)  # 粗略估算
-
+    user_tokens = _count_tokens(user_question)
     system_target = max(500, target_input_tokens - user_tokens)
 
     # 缓存 key 取最接近的 500 token 档位
@@ -127,10 +166,7 @@ def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None)
     if cache_key in _GEN_BENCH_SYSTEM:
         system_text = _GEN_BENCH_SYSTEM[cache_key]
     else:
-        # 重复填充到目标长度（英文 ~0.75 token/word ≈ 4 chars/token）
-        needed_chars = system_target * 4
-        repeats = max(1, needed_chars // len(_BENCH_BASE_TEXT) + 1)
-        system_text = _BENCH_BASE_TEXT * repeats
+        system_text = _gen_text_for_tokens(system_target)
         _GEN_BENCH_SYSTEM[cache_key] = system_text
 
     return [
@@ -142,9 +178,12 @@ def _gen_benchmark_messages(target_input_tokens: int, user_question: str = None)
 def _gen_context_padding(target_tokens: int, chars_per_token: float = 4.8) -> str:
     """生成约 target_tokens 长的英文 padding 文本，用于上下文窗口测试。
 
-    英文 ~4 chars/token，用 _BENCH_BASE_TEXT 重复填充，估算比中文"测"准确得多。
-    返回 (padding_text, estimated_tokens)。
+    有 tiktoken 时精确生成，否则 fallback 到字符估算。
     """
+    if _TIKENC is not None:
+        text = _gen_text_for_tokens(target_tokens)
+        return text, _count_tokens(text)
+
     needed_chars = int(target_tokens * chars_per_token)
     repeats = max(1, needed_chars // len(_BENCH_BASE_TEXT) + 1)
     text = (_BENCH_BASE_TEXT * repeats)[:needed_chars]
@@ -366,6 +405,12 @@ def parse_args():
         help="梯度测试最大并发数 (默认: 1000)",
     )
     parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="固定输出长度（TC-11 专用）。覆盖 TC-02/TC-11 中 max_tokens 的自动计算。",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=50,
@@ -542,7 +587,7 @@ def parse_io_tiers(raw: str) -> list:
         tiers.append({
             "name": f"{in_s.strip()}:{out_s.strip()}",
             "input_tokens": in_tok,
-            "output_tokens": out_tok,
+            "output_tokens": out_tok if r["ok"] else 0,
         })
     return tiers
 
@@ -560,7 +605,7 @@ def _build_naive_sweep(args, max_context=None) -> tuple:
       - >380K     → 7K output    (P99 延伸，不继续增加)
     """
     step_size = getattr(args, 'io_step', 10000) or 10000
-    input_start = step_size  # 起始值 = 步长
+    input_start = 10000  # 起始值固定 10K
     input_step = step_size
     input_max = max_context if max_context else 380000
 
@@ -589,7 +634,7 @@ def _build_naive_sweep(args, max_context=None) -> tuple:
         sweep.append({
             "seq": seq,
             "input_tokens": current,
-            "output_tokens": out_tok,
+            "output_tokens": out_tok if r["ok"] else 0,
             "tier": tier_label,
         })
         names.append(f"{tier_label}({current//1000}K→{out_tok/1000:.1f}K)")
@@ -1079,6 +1124,7 @@ def build_cfg(args) -> dict:
 
     return {
         "stream": not args.no_stream,
+        "_cli_max_output_tokens": args.max_output_tokens,
         "api": {
             "url": args.url,
             "key": args.key,
@@ -1169,6 +1215,10 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
                     stats["fail"] += 1
                     if r["error"] and len(stats["errors"]) < 20:
                         stats["errors"].append(r["error"])
+                    err = r.get("error", "未知错误")
+                    status = r.get("status_code", "")
+                    tag = f"HTTP {status}" if status else ""
+                    print(f"           [FAIL] req={_idx} {tag} {err[:120]}")
             return r
 
         t0 = time.perf_counter()
@@ -1241,6 +1291,134 @@ def test_tps_benchmark(cfg: dict, case: dict) -> dict:
                        "tps_tokens": best["tps_tokens"], "tpm_tokens": best["tpm_tokens"],
                        "decode_tps": best["decode_tps"], "decode_tpm": best["decode_tpm"],
                        "best_concurrency": best["concurrency"]}}
+
+
+def test_fixed_io_concurrency_sweep(cfg: dict, case: dict) -> dict:
+    """TC-11: 固定输入输出长度 + 并发梯度 — 测量 TTFT/TPOT/Decode TPS 随并发变化。
+
+    与 TC-02 区别：输入长度和输出长度固定（不随并发变化），
+    默认 in=50K out=0.2K，专门用于评估固定负载下不同并发的性能衰减。
+    """
+    api = cfg["api"]
+    params = case.get("params", {})
+    input_tokens = params.get("input_tokens", 50000)
+    max_tokens = params.get("max_tokens", 200)
+    # 优先使用 CLI 显式传入的 --max-output-tokens
+    cli_max_out = cfg.get("_cli_max_output_tokens")
+    if cli_max_out is not None:
+        max_tokens = cli_max_out
+    messages = _gen_benchmark_messages(input_tokens)
+    timeout = api.get("timeout", 60)
+    gradient = cfg["benchmark"].get("gradient", {})
+
+    def _run_bench(concurrency: int, total: int):
+        stats = {"ok": 0, "fail": 0,
+                 "total_ttft": 0.0, "total_decode_time": 0.0, "total_latency": 0.0,
+                 "total_prompt_tokens": 0, "total_completion_tokens": 0,
+                 "total_tokens": 0, "errors": []}
+
+        def _worker(_idx):
+            varied_msgs = [dict(m) for m in messages]
+            varied_msgs[-1]["content"] += f"\n\n[req:{_idx}]"
+            r = _api_request_auto(url=api["url"], key=api["key"], model=api["model"],
+                                   messages=varied_msgs, max_tokens=max_tokens,
+                                   timeout=timeout, stream=cfg.get("stream", True))
+            with _stats_lock:
+                if r["ok"]:
+                    stats["ok"] += 1
+                    ttft = r.get("ttft", 0)
+                    total_lat = r.get("total_latency", 0)
+                    decode_t = total_lat - ttft if total_lat > ttft else 0
+                    stats["total_ttft"] += ttft
+                    stats["total_decode_time"] += decode_t
+                    stats["total_latency"] += total_lat
+                    stats["total_prompt_tokens"] += r.get("prompt_tokens", 0)
+                    stats["total_completion_tokens"] += r.get("completion_tokens", 0)
+                    stats["total_tokens"] += r.get("total_tokens", 0)
+                else:
+                    stats["fail"] += 1
+                    if r["error"] and len(stats["errors"]) < 20:
+                        stats["errors"].append(r["error"])
+                    err = r.get("error", "未知错误")
+                    status = r.get("status_code", "")
+                    tag = f"HTTP {status}" if status else ""
+                    print(f"           [FAIL] req={_idx} {tag} {err[:120]}")
+            return r
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = []
+            for i in range(total):
+                futures.append(pool.submit(_worker, i))
+                time.sleep(0.02)
+            for f in as_completed(futures):
+                f.result()
+        elapsed = time.perf_counter() - t0
+
+        success_rate = stats["ok"] / total * 100 if total else 0
+        tps_tokens = stats["total_tokens"] / elapsed if elapsed > 0 else 0
+        decode_tps = (stats["total_completion_tokens"] / stats["total_decode_time"]
+                      if stats["total_decode_time"] > 0 else 0)
+        prefill_tps = (stats["total_prompt_tokens"] / stats["total_ttft"]
+                       if stats["total_ttft"] > 0 else 0)
+        avg_latency = stats["total_latency"] / stats["ok"] if stats["ok"] else 0
+        avg_ttft = stats["total_ttft"] / stats["ok"] if stats["ok"] else 0
+        avg_tpot = (stats["total_decode_time"] / stats["total_completion_tokens"] * 1000
+                    if stats["total_completion_tokens"] > 0 else 0)
+
+        error_counts = {}
+        for err in stats["errors"]:
+            cat = _error_category(err, None)
+            error_counts[cat] = error_counts.get(cat, 0) + 1
+
+        return {"concurrency": concurrency, "total": total,
+                "elapsed": round(elapsed, 2), "ok": stats["ok"], "fail": stats["fail"],
+                "success_rate": f"{success_rate:.1f}%",
+                "tps_tokens": f"{tps_tokens:.1f}", "tpm_tokens": f"{tps_tokens * 60:.1f}",
+                "tps_per_c": round(tps_tokens / concurrency, 1) if concurrency else 0,
+                "decode_tps": f"{decode_tps:.1f}", "decode_tpm": f"{decode_tps * 60:.1f}",
+                "prefill_tps": f"{prefill_tps:.1f}",
+                "avg_latency": round(avg_latency, 3), "avg_ttft": round(avg_ttft, 3),
+                "avg_tpot_ms": round(avg_tpot, 1),
+                "total_tokens": stats["total_tokens"],
+                "total_prompt_tokens": stats["total_prompt_tokens"],
+                "total_completion_tokens": stats["total_completion_tokens"],
+                "error_counts": error_counts}
+
+    g_start = gradient["start"]
+    g_step = gradient["step"]
+    g_max = max(gradient["max"], g_start)
+    levels = []
+
+    print(f"         [固定IO梯度] in={input_tokens//1000}K out={max_tokens}, {g_start} → {g_max} (步长 {g_step})")
+    for c in range(g_start, g_max + 1, g_step):
+        print(f"         [{c}] 并发={c} 请求={c} ... ", end="", flush=True)
+        lr = _run_bench(c, c)
+        levels.append(lr)
+        print(f"ok={lr['ok']} fail={lr['fail']} TTFT={lr['avg_ttft']}s TPOT={lr['avg_tpot_ms']}ms Decode={lr['decode_tps']} tok/s")
+        if c + g_step <= g_max:
+            time.sleep(1)
+
+    total_ok = sum(l["ok"] for l in levels)
+    total_fail = sum(l["fail"] for l in levels)
+    total_tokens_all = sum(l["total_tokens"] for l in levels)
+    if levels:
+        best = max(levels, key=lambda l: float(l["tps_tokens"]))
+    else:
+        best = {"tps_tokens": "0", "tpm_tokens": "0", "decode_tps": "0", "decode_tpm": "0"}
+    passed = total_ok > 0
+
+    return {"case_id": case["id"], "passed": passed,
+            "detail": {"mode": "gradient",
+                       "input_tokens": input_tokens, "max_tokens": max_tokens,
+                       "levels": levels,
+                       "ok": total_ok, "fail": total_fail,
+                       "total_tokens": total_tokens_all,
+                       "tps_tokens": best["tps_tokens"], "tpm_tokens": best["tpm_tokens"],
+                       "decode_tps": best["decode_tps"], "decode_tpm": best["decode_tpm"],
+                       "best_concurrency": best["concurrency"]}}
+
+
 def test_tpm_calc(cfg: dict, case: dict, prev_result: dict = None) -> dict:
     """TC-03: TPM 换算 — 基于 TC-02 的 TPS 结果验证 TPM = TPS x 60。"""
     passed = False
@@ -2230,7 +2408,7 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
                 "step_seq": seq,
                 "rep": rep,
                 "input_tokens": in_tok,
-                "output_tokens": out_tok,
+                "output_tokens": out_tok if r["ok"] else 0,
                 "tier": tier_label,
                 "label": f"{seq}-{rep}" if actual_reps > 1 else str(seq),
             })
@@ -2255,7 +2433,7 @@ def test_io_sweep_benchmark(cfg: dict, case: dict) -> dict:
             "step_seq": task["step_seq"],
             "rep": task["rep"],
             "input_tokens": in_tok,
-            "output_tokens": out_tok,
+            "output_tokens": out_tok if r["ok"] else 0,
             "tier": task["tier"],
             "status": "ok" if r["ok"] else "fail",
             "ttft": 0.0,
@@ -2575,7 +2753,7 @@ def test_io_tier_benchmark(cfg: dict, case: dict) -> dict:
         tier_results.append({
             "name": name,
             "input_tokens": in_tok,
-            "output_tokens": out_tok,
+            "output_tokens": out_tok if r["ok"] else 0,
             "concurrency": tier_concurrency,
             "total": total,
             "ok": stats["ok"],
@@ -2644,6 +2822,78 @@ def _gen_io_mix_requests(n: int, in_anchors: list, out_anchors: list) -> list:
         inp = int(round(lerp(in_anchors, r)))
         outp = int(round(lerp(out_anchors, r)))
         reqs.append({"seq": i, "input_tokens": max(1, inp), "output_tokens": max(1, outp)})
+    return reqs
+
+
+def _gen_normal_distributed_requests(n: int, in_target: dict, out_target: dict,
+                                      correlation: float = 0.8) -> list:
+    """按对数正态分布（离散拟合）生成 n 条 (input_tokens, output_tokens) 请求。
+
+    输入输出通过二元正态分布 + Cholesky 分解实现正相关（长输入→长输出）。
+
+    in_target/out_target: {'p50': int, 'p90': int, 'p99': int, 'avg': int}
+    correlation: 输入输出的相关系数 (0~1)，默认 0.8
+
+    算法：
+      1. 从目标百分位拟合对数正态参数 μ, σ
+      2. 生成 n 个二元正态样本（Cholesky 分解）
+      3. 转换为对数正态 → 取整
+      4. 分位数校准确保精确匹配目标百分位
+    """
+    import math
+    # ── 1. 拟合对数正态参数 ──
+    mu_in = math.log(in_target['p50'])
+    sigma_in = (math.log(in_target['p90']) - math.log(in_target['p50'])) / 1.28
+    mu_out = math.log(out_target['p50'])
+    sigma_out = (math.log(out_target['p90']) - math.log(out_target['p50'])) / 1.28
+
+    # ── 2. 生成二元正态样本（Box-Muller + Cholesky）──
+    import random
+    random.seed(42)
+    z1_list = []
+    z2_list = []
+    for _ in range(n):
+        u1, u2 = random.random(), random.random()
+        z1 = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
+        z2 = math.sqrt(-2 * math.log(u1)) * math.sin(2 * math.pi * u2)
+        z1_list.append(z1)
+        z2_list.append(z2)
+
+    # Cholesky: X1=Z1, X2=ρ·Z1+√(1-ρ²)·Z2
+    rho = correlation
+    one_minus_rho2 = math.sqrt(1 - rho * rho)
+    x1_list = z1_list
+    x2_list = [rho * z1 + one_minus_rho2 * z2 for z1, z2 in zip(z1_list, z2_list)]
+
+    # ── 3. 转换为对数正态 → 取整 ──
+    raw_in = [int(round(math.exp(mu_in + sigma_in * x))) for x in x1_list]
+    raw_out = [max(200, int(round(math.exp(mu_out + sigma_out * x)))) for x in x2_list]
+
+    # ── 4. 分位数校准 ──
+    def quantile_calibrate(values, target):
+        """将排序后的值校准到目标百分位。"""
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        # 计算目标百分位对应的索引
+        p50_idx = int(0.50 * (n - 1))
+        p90_idx = int(0.90 * (n - 1))
+        p99_idx = int(0.99 * (n - 1))
+        # 替换目标百分位处的值
+        sorted_vals[p50_idx] = target['p50']
+        sorted_vals[p90_idx] = target['p90']
+        sorted_vals[p99_idx] = target['p99']
+        return sorted_vals
+
+    cal_in = quantile_calibrate(raw_in, in_target)
+    cal_out = quantile_calibrate(raw_out, out_target)
+
+    reqs = []
+    for i in range(n):
+        reqs.append({
+            "seq": i + 1,
+            "input_tokens": max(1, cal_in[i]),
+            "output_tokens": max(1, cal_out[i]),
+        })
     return reqs
 
 
@@ -2729,10 +2979,17 @@ def test_io_mix_benchmark(cfg: dict, case: dict) -> dict:
             completion = r.get("completion_tokens", 0)
             rec["ttft"] = ttft
             rec["completion_tokens"] = completion
-            rec["decode_tps"] = round(completion / decode_d, 1) if decode_d > 0 else 0
-            rec["tpot_ms"] = round(decode_d / completion * 1000, 2) if completion > 0 else 0
+            # 对于极短输出(decode阶段<0.5s)，用total_latency计算整体TPS更稳定
+            effective_d = total_lat if decode_d < 0.5 else decode_d
+            rec["decode_tps"] = round(completion / effective_d, 1) if effective_d > 0 else 0
+            rec["tpot_ms"] = round(effective_d / completion * 1000, 2) if completion > 0 else 0
             times = r.get("token_times", [])
             rec["itl_max_ms"] = round((max(times) - min(times)) * 1000, 1) if len(times) >= 2 else 0
+        else:
+            err = r.get("error", "未知错误")
+            status = r.get("status_code", "")
+            tag = f"HTTP {status}" if status else ""
+            print(f"           [FAIL] seq={req['seq']} in={in_tok} out={out_tok} {tag} {err[:120]}")
         return rec
 
     t_start = time.perf_counter()
@@ -2783,6 +3040,151 @@ def test_io_mix_benchmark(cfg: dict, case: dict) -> dict:
             "max_context": max_ctx,
             "in_anchors": in_anchors,
             "out_anchors": out_anchors,
+            "ttft_p50": ttft_pct["p50"], "ttft_p75": ttft_pct["p75"],
+            "ttft_p90": ttft_pct["p90"], "ttft_p99": ttft_pct["p99"],
+            "decode_tps_p50": decode_pct["p50"], "decode_tps_p99": decode_pct["p99"],
+            "tpot_p50_ms": tpot_pct["p50"], "tpot_p75_ms": tpot_pct["p75"],
+            "tpot_p90_ms": tpot_pct["p90"], "tpot_p99_ms": tpot_pct["p99"],
+            "itl_max_p50_ms": itl_pct["p50"], "itl_max_p90_ms": itl_pct["p90"], "itl_max_p99_ms": itl_pct["p99"],
+            "requests": per_req,
+            "verdict": verdict,
+        },
+    }
+
+
+def test_normal_dist_io_benchmark(cfg: dict, case: dict) -> dict:
+    """TC-12: 正态分布混合IO性能 — 对数正态分布拟合 + 输入输出相关。
+
+    与 TC-10 io_mix 区别：
+      - 请求长度用对数正态分布生成（而非线性插值）
+      - 输入输出通过二元正态分布 + Cholesky 分解实现正相关
+      - 默认 in: P50=50K P90=160K P99=380K AVG=80K
+      - 默认 out: P50=0.2K P90=1.3K P99=7K AVG=0.6K
+    """
+    api = cfg["api"]
+    params = case.get("params", {})
+    n = int(params.get("total_requests") or 200)
+    concurrency = int(params.get("concurrency") or cfg["benchmark"].get("concurrency", 4))
+    timeout = api.get("timeout", 120)
+    max_out = int(params.get("max_output", 8192))
+    max_ctx = params.get("max_context")
+    correlation = float(params.get("correlation", 0.8))
+
+    in_target = params.get("in_target") or {"p50": 50000, "p90": 160000, "p99": 380000, "avg": 80000}
+    out_target = params.get("out_target") or {"p50": 200, "p90": 1300, "p99": 7000, "avg": 600}
+
+    reqs = _gen_normal_distributed_requests(n, in_target, out_target, correlation)
+
+    # ── 最大上下文过滤 ──
+    skipped = 0
+    if max_ctx:
+        kept = []
+        for req in reqs:
+            if req["input_tokens"] + req["output_tokens"] <= max_ctx:
+                kept.append(req)
+            else:
+                skipped += 1
+                req["status"] = "skipped"
+                req["skip_reason"] = f"输入+输出超出上下文上限 {max_ctx}"
+                req["ttft"] = 0.0
+                req["decode_tps"] = 0.0
+                req["tpot_ms"] = 0.0
+                req["itl_max_ms"] = 0.0
+                req["completion_tokens"] = 0
+        reqs = kept
+    print(f"         [正态分布IO] 共 {n} 条请求（对数正态拟合, ρ={correlation}）"
+          + (f"，跳过 {skipped} 条（超上下文上限 {max_ctx}）" if skipped else ""))
+
+    def _worker(req):
+        in_tok = req["input_tokens"]
+        out_tok = min(req["output_tokens"], max_out)
+        messages = _gen_benchmark_messages(in_tok, user_question=(
+            f"Write a detailed technical answer of about {max(200, out_tok // 2)} words "
+            f"covering the topic above. Be thorough and structured. [seq:{req['seq']}]"
+        ))
+        varied = [dict(m) for m in messages]
+        varied[-1]["content"] += f"\n\n[req:{req['seq']}]"
+        r = _api_request_auto(
+            url=api["url"], key=api["key"], model=api["model"],
+            messages=varied, max_tokens=out_tok, timeout=timeout,
+            stream=cfg.get("stream", True),
+        )
+        rec = {
+            "seq": req["seq"], "input_tokens": in_tok, "output_tokens": out_tok,
+            "status": "ok" if r["ok"] else "fail",
+            "error": r.get("error"),
+            "ttft": 0.0, "decode_tps": 0.0, "tpot_ms": 0.0, "itl_max_ms": 0.0,
+            "completion_tokens": 0,
+        }
+        if r["ok"]:
+            ttft = r.get("ttft", 0)
+            total_lat = r.get("total_latency", 0)
+            decode_d = total_lat - ttft if total_lat > ttft else 0
+            completion = r.get("completion_tokens", 0)
+            rec["ttft"] = ttft
+            rec["completion_tokens"] = completion
+            # 对于极短输出(decode阶段<0.5s)，用total_latency计算整体TPS更稳定
+            effective_d = total_lat if decode_d < 0.5 else decode_d
+            rec["decode_tps"] = round(completion / effective_d, 1) if effective_d > 0 else 0
+            rec["tpot_ms"] = round(effective_d / completion * 1000, 2) if completion > 0 else 0
+            times = r.get("token_times", [])
+            rec["itl_max_ms"] = round((max(times) - min(times)) * 1000, 1) if len(times) >= 2 else 0
+        else:
+            err = r.get("error", "未知错误")
+            status = r.get("status_code", "")
+            tag = f"HTTP {status}" if status else ""
+            print(f"           [FAIL] seq={req['seq']} in={in_tok} out={out_tok} {tag} {err[:120]}")
+        return rec
+
+    t_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(_worker, req) for req in reqs]
+        for f in as_completed(futures):
+            f.result()
+    elapsed = round(time.perf_counter() - t_start, 2)
+
+    per_req = [f.result() for f in futures]
+    per_req.sort(key=lambda x: x["seq"])
+
+    ok_recs = [r for r in per_req if r["status"] == "ok"]
+    skipped_recs = [r for r in per_req if r["status"] == "skipped"]
+    fail_count = len(per_req) - len(ok_recs) - len(skipped_recs)
+
+    ttfts = [r["ttft"] for r in ok_recs]
+    decode_tpss = [r["decode_tps"] for r in ok_recs]
+    tpots = [r["tpot_ms"] for r in ok_recs]
+    itl_maxs = [r["itl_max_ms"] for r in ok_recs]
+
+    ttft_pct = _percentiles(ttfts, 50, 75, 90, 99)
+    decode_pct = _percentiles(decode_tpss, 50, 99)
+    tpot_pct = _percentiles(tpots, 50, 75, 90, 99)
+    itl_pct = _percentiles(itl_maxs, 50, 90, 99)
+
+    passed = len(ok_recs) > 0
+    verdict = (
+        f"正态分布IO {n} 条请求完成: 成功 {len(ok_recs)}/{len(per_req) if not skipped_recs else n}, "
+        f"跳过 {len(skipped_recs)}/{n}（超上下文）"
+        if skipped_recs else
+        f"正态分布IO {n} 条请求完成: 成功 {len(ok_recs)}/{n}, "
+        f"TTFT p50={ttft_pct['p50']}s p99={ttft_pct['p99']}s, "
+        f"Decode p50={decode_pct['p50']}tok/s, TPOT p99={tpot_pct['p99']}ms"
+    )
+
+    return {
+        "case_id": case["id"],
+        "passed": passed,
+        "detail": {
+            "mode": "normal_mix",
+            "total_requests": n,
+            "concurrency": concurrency,
+            "elapsed": elapsed,
+            "ok": len(ok_recs),
+            "fail": fail_count,
+            "skipped": len(skipped_recs),
+            "max_context": max_ctx,
+            "correlation": correlation,
+            "in_target": in_target,
+            "out_target": out_target,
             "ttft_p50": ttft_pct["p50"], "ttft_p75": ttft_pct["p75"],
             "ttft_p90": ttft_pct["p90"], "ttft_p99": ttft_pct["p99"],
             "decode_tps_p50": decode_pct["p50"], "decode_tps_p99": decode_pct["p99"],
@@ -2942,14 +3344,17 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 )
                 if not passed and detail.get("error"):
                     actual += f", 错误: {detail['error']}"
-            elif cid == "TC-02":
+            elif cid in ("TC-02", "TC-11"):
                 if detail.get("mode") == "gradient":
                     lvs = detail.get("levels", [])
                     best_c = detail.get("best_concurrency", "?")
                 if detail.get("mode") == "gradient":
                     lvs = detail.get("levels", [])
                     best_c = detail.get("best_concurrency", "?")
-                    actual = (f"梯度{lvs[0]['concurrency']}→{lvs[-1]['concurrency']}({len(lvs)}级), "
+                    io_tag = ""
+                    if cid == "TC-11":
+                        io_tag = f"[固定in={detail.get('input_tokens','?')} out={detail.get('max_tokens','?')}] "
+                    actual = (f"{io_tag}梯度{lvs[0]['concurrency']}→{lvs[-1]['concurrency']}({len(lvs)}级), "
                               f"最高TPS={detail.get('tps_tokens')}tok/s(并发={best_c}), "
                               f"Decode={detail.get('decode_tps')}tok/s, "
                               f"总成功/失败={detail.get('ok')}/{detail.get('fail')}")
@@ -3048,6 +3453,15 @@ def write_single_csv(results: list, cases: list, cfg: dict, output_path: Path) -
                 )
                 if detail.get("verdict"):
                     actual += f" | {detail['verdict'][:120]}"
+            elif cid == "TC-12":
+                d = detail
+                actual = (
+                    f"正态分布IO {d.get('total_requests')} 条: 成功{d.get('ok')}/{d.get('total_requests')}, "
+                    f"TTFT p50={d.get('ttft_p50')}s p99={d.get('ttft_p99')}s, "
+                    f"Decode p50={d.get('decode_tps_p50')}tok/s, "
+                    f"TPOT p50={d.get('tpot_p50_ms')}ms, "
+                    f"ρ={d.get('correlation','N/A')}"
+                )
             elif cid == "TC-10":
                 mode = detail.get("mode", "io_tier")
                 if mode == "io_mix":
@@ -3124,18 +3538,21 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
         if cid == "TC-01":
             u = d.get("usage") or {}
             lines.append(f"HTTP{d.get('status_code')}|{d.get('latency','N/A')}s|{u.get('total','N/A')}tokens\n")
-        elif cid == "TC-02":
+        elif cid in ("TC-02", "TC-11"):
             lvs = d.get("levels", [])
             if lvs:
                 best_c = d.get("best_concurrency", "?")
                 at = lvs[0].get("total_tokens", 0) // max(lvs[0].get("ok", 1), 1) if lvs else 0
+                io_info = ""
+                if cid == "TC-11":
+                    io_info = f"(固定in={d.get('input_tokens','?')} out={d.get('max_tokens','?')}) "
                 lines.append(f"最高TPS**{d.get('tps_tokens')}**tok/s(并发={best_c})|Decode**{d.get('decode_tps')}**tok/s|均≈{at}tok/请求")
-                lines.append("|并发|成功|失败|耗时|TPS|TPS/并|Dec TPS|Prefill TPS|总Tok|输入Tok|输出Tok|TTFT|延迟|错误|")
-                lines.append("|------|------|------|------|-----|-----|---------|-----------|-----|-----|-----|----|------|------|")
+                lines.append(f"|并发|成功|失败|耗时|TPS|TPS/并|Dec TPS|Prefill TPS|TTFT|TPOT|总Tok|输入Tok|输出Tok|延迟|错误|")
+                lines.append("|------|------|------|------|-----|-----|---------|-----------|----|----|-----|-----|-----|------|------|")
                 for lv in lvs:
                     ec = lv.get("error_counts", {})
                     es = ", ".join(f"{c}×{n}" for c, n in sorted(ec.items(), key=lambda x: -x[1])[:2]) or "-"
-                    lines.append(f"|{lv['concurrency']}|{lv['ok']}|{lv['fail']}|{lv['elapsed']}s|{lv['tps_tokens']}|{lv.get('tps_per_c','N/A')}|{lv['decode_tps']}|{lv.get('prefill_tps','N/A')}|{lv['total_tokens']}|{lv['total_prompt_tokens']}|{lv['total_completion_tokens']}|{lv.get('avg_ttft','N/A')}s|{lv['avg_latency']}s|{es}|")
+                    lines.append(f"|{lv['concurrency']}|{lv['ok']}|{lv['fail']}|{lv['elapsed']}s|{lv['tps_tokens']}|{lv.get('tps_per_c','N/A')}|{lv['decode_tps']}|{lv.get('prefill_tps','N/A')}|{lv.get('avg_ttft','N/A')}s|{lv.get('avg_tpot_ms','N/A')}ms|{lv['total_tokens']}|{lv['total_prompt_tokens']}|{lv['total_completion_tokens']}|{lv['avg_latency']}s|{es}|")
                 lines.append("")
         elif cid == "TC-03":
             lines.append(f"TC-02 TPS={d.get('tps')}→TPM={d.get('tpm')}|TPM=TPS×60:{'✅正确' if d.get('formula_ok') else '❌不符'}\n")
@@ -3173,6 +3590,27 @@ def write_markdown_report(results, cases, cfg, args, output_path, test_time):
             lines.append(f"命中率{d.get('cache_hit_rate_pct','N/A')}%|TPM{d.get('tpm_tokens','N/A')}tok/min|prompt={d.get('total_prompt_tokens','N/A')}compl={d.get('total_completion_tokens','N/A')}|预热prompt={wu.get('prompt_tokens','N/A')}|TTFT预热={wu.get('ttft','N/A')}s→并发={d.get('ttft_avg','N/A')}s|ok={d.get('ok',0)}fail={d.get('fail',0)}{w}")
             ec = d.get("error_counts", {})
             if ec: lines.append(f"失败:{', '.join(f'{c}×{n}' for c,n in sorted(ec.items(),key=lambda x:-x[1])[:3])}")
+            lines.append("")
+        elif cid == "TC-12":
+            lines.append(f"正态分布IO{d.get('total_requests')}条|成功{d.get('ok')}/{d.get('total_requests')}|并发={d.get('concurrency','N/A')}|ρ={d.get('correlation','N/A')}|耗时{d.get('elapsed','N/A')}s")
+            lines.append(f"**TTFT**: p50={d.get('ttft_p50')}s p75={d.get('ttft_p75')}s p90={d.get('ttft_p90')}s p99={d.get('ttft_p99')}s")
+            lines.append(f"**Decode TPS**: p50={d.get('decode_tps_p50')} p99={d.get('decode_tps_p99')} | **TPOT**: p50={d.get('tpot_p50_ms')}ms p99={d.get('tpot_p99_ms')}ms")
+            lines.append(f"**ITL max**: p50={d.get('itl_max_p50_ms')}ms p90={d.get('itl_max_p90_ms')}ms p99={d.get('itl_max_p99_ms')}ms")
+            # 错误分布
+            err_map = {}
+            for rq in d.get("requests", []):
+                if rq.get("status") == "fail" or rq.get("error"):
+                    cat = rq.get("error", "未知错误")[:60]
+                    err_map[cat] = (err_map.get(cat, 0)) + 1
+            if err_map:
+                lines.append("**错误分布**:")
+                for cat, n in sorted(err_map.items(), key=lambda x: -x[1]):
+                    lines.append(f"  - `{cat}` ×{n}")
+            lines.append("|#|in|out|状态|TTFT|DecodeTPS|TPOT|ITLmax|")
+            lines.append("|--|--|--|--|--|--|--|--|")
+            for rq in d.get("requests", []):
+                st = "✅" if rq.get("status") == "ok" else "❌"
+                lines.append(f"|{rq.get('seq')}|{rq.get('input_tokens')}|{rq.get('output_tokens')}|{st}|{rq.get('ttft')}|{rq.get('decode_tps')}|{rq.get('tpot_ms')}|{rq.get('itl_max_ms')}|")
             lines.append("")
         elif cid == "TC-10":
             mode = d.get("mode", "io_tier")
@@ -3244,6 +3682,19 @@ def write_html_report(results, cases, cfg, args, output_path, test_time, model_i
     tc02d = tc02.get("detail", {}) or {}
     tc02_levels = tc02d.get("levels", [])
     tc02_has_data = bool(tc02_levels)
+
+    # ── TC-11 数据提取 ──
+    tc11 = rm.get("TC-11", {})
+    tc11d = tc11.get("detail", {}) or {}
+    tc11_levels = tc11d.get("levels", [])
+    tc11_has_data = bool(tc11_levels)
+
+    # ── TC-12 数据提取 ──
+    tc12 = rm.get("TC-12", {})
+    tc12d = tc12.get("detail", {}) or {}
+    tc12_requests = tc12d.get("requests", [])
+    tc12_ok_recs = [r for r in tc12_requests if r.get("status") == "ok"]
+    tc12_has_data = bool(tc12_requests)
 
     # ── TC-10 输入/输出 token 分位数 ──
     in_tokens = sorted([r.get("input_tokens", 0) for r in tc10_ok_recs])
@@ -3356,6 +3807,54 @@ def write_html_report(results, cases, cfg, args, output_path, test_time, model_i
                 "tpot_avg_ms": ts.get("tpot_avg_ms", 0),
             } for ts in tc10d.get("tier_stats", [])],
         } if tc10_has_data else None,
+        "tc11": {
+            "passed": tc11.get("passed", False),
+            "input_tokens": tc11d.get("input_tokens", 0),
+            "max_tokens": tc11d.get("max_tokens", 0),
+            "levels": tc11d.get("levels", []),
+        } if tc11_has_data else None,
+        "tc12": {
+            "mode": tc12d.get("mode", ""),
+            "passed": tc12.get("passed", False),
+            "totalRequests": tc12d.get("total_requests", 0),
+            "concurrency": tc12d.get("concurrency", 0),
+            "elapsed": tc12d.get("elapsed", 0),
+            "ok": tc12d.get("ok", 0),
+            "fail": tc12d.get("fail", 0),
+            "correlation": tc12d.get("correlation", 0),
+            "ttft_p50": tc12d.get("ttft_p50", 0),
+            "ttft_p75": tc12d.get("ttft_p75", 0),
+            "ttft_p90": tc12d.get("ttft_p90", 0),
+            "ttft_p99": tc12d.get("ttft_p99", 0),
+            "decode_tps_p50": tc12d.get("decode_tps_p50", 0),
+            "decode_tps_p99": tc12d.get("decode_tps_p99", 0),
+            "tpot_p50_ms": tc12d.get("tpot_p50_ms", 0),
+            "tpot_p75_ms": tc12d.get("tpot_p75_ms", 0),
+            "tpot_p90_ms": tc12d.get("tpot_p90_ms", 0),
+            "tpot_p99_ms": tc12d.get("tpot_p99_ms", 0),
+            "itl_max_p50_ms": tc12d.get("itl_max_p50_ms", 0),
+            "itl_max_p90_ms": tc12d.get("itl_max_p90_ms", 0),
+            "itl_max_p99_ms": tc12d.get("itl_max_p99_ms", 0),
+            "in_p50": _pct(sorted([r.get("input_tokens", 0) for r in tc12_ok_recs]), 50),
+            "in_avg": _avg([r.get("input_tokens", 0) for r in tc12_ok_recs]),
+            "in_p90": _pct(sorted([r.get("input_tokens", 0) for r in tc12_ok_recs]), 90),
+            "in_p99": _pct(sorted([r.get("input_tokens", 0) for r in tc12_ok_recs]), 99),
+            "out_p50": _pct(sorted([r.get("completion_tokens", 0) for r in tc12_ok_recs]), 50),
+            "out_avg": _avg([r.get("completion_tokens", 0) for r in tc12_ok_recs]),
+            "out_p90": _pct(sorted([r.get("completion_tokens", 0) for r in tc12_ok_recs]), 90),
+            "out_p99": _pct(sorted([r.get("completion_tokens", 0) for r in tc12_ok_recs]), 99),
+            "requests": [{
+                "seq": r.get("seq", i + 1),
+                "input_tokens": r.get("input_tokens", 0),
+                "output_tokens": r.get("output_tokens", 0),
+                "status": r.get("status", "?"),
+                "ttft": r.get("ttft", 0),
+                "decode_tps": r.get("decode_tps", 0),
+                "tpot_ms": r.get("tpot_ms", 0),
+                "itl_max_ms": r.get("itl_max_ms", 0),
+                "error": r.get("error", ""),
+            } for i, r in enumerate(tc12_requests)],
+        } if tc12_has_data else None,
         "cases": [{
             "id": c["id"],
             "name": c.get("name", ""),
@@ -3486,6 +3985,8 @@ footer{{margin-top:30px; font-family:var(--mono); font-size:11px; color:var(--mu
   <div class="kpi">{_kpi_tc10_ttft(tc10d, tc10_mode)}</div>
   <div class="kpi">{_kpi_tc10_tpot(tc10d, tc10_mode)}</div>
   <div class="kpi">{_kpi_tc10_decode(tc10d, tc10_mode)}</div>
+  {_render_tc11_kpis(tc11_has_data, tc11d)}
+  {_render_tc12_kpis(tc12_has_data, tc12d)}
 </div>
 
 <div class="grid">
@@ -3493,6 +3994,12 @@ footer{{margin-top:30px; font-family:var(--mono); font-size:11px; color:var(--mu
   {_render_tc10_charts(tc10_has_data, tc10_mode)}
 
   {_render_tc02_chart(tc02_has_data)}
+
+  {_render_tc11_charts(tc11_has_data)}
+
+  {_render_tc12_charts(tc12_has_data)}
+
+  {_render_tc12_error_summary(tc12_has_data)}
 
   <!-- 全部用例汇总表 -->
   <div class="panel c-cyan span-12 summary-section">
@@ -3514,6 +4021,10 @@ footer{{margin-top:30px; font-family:var(--mono); font-size:11px; color:var(--mu
   </div>
 
   {_render_tc10_detail_table(tc10_has_data)}
+
+  {_render_tc11_detail_table(tc11_has_data)}
+
+  {_render_tc12_detail_table(tc12_has_data)}
 
 </div>
 
@@ -3546,6 +4057,16 @@ window.REPORT = {report_json};
   {_render_tc02_chart_js()}
 
   {_render_tc10_table_js()}
+
+  {_render_tc11_charts_js()}
+
+  {_render_tc11_table_js()}
+
+  {_render_tc12_charts_js()}
+
+  {_render_tc12_error_js()}
+
+  {_render_tc12_table_js()}
 
 }})();
 </script>
@@ -3654,6 +4175,65 @@ def _render_tc10_charts(has_data, mode):
     <div class="chart-box h-260"><canvas id="chartTier"></canvas></div>
   </div>'''
 
+def _render_tc11_charts(has_data):
+    if not has_data:
+        return ""
+    return '''<!-- TC-11 固定IO并发梯度 -->
+  <div class="panel c-amber span-6">
+    <div class="panel-head"><div class="panel-title">TC-11 TTFT 随并发变化</div><div class="panel-tag">FIXED_IO · TTFT vs CONCURRENCY</div></div>
+    <div class="panel-sub">X轴：并发数 · Y轴：TTFT (s) · 固定输入输出</div>
+    <div class="chart-box h-260"><canvas id="chartTC11TTFT"></canvas></div>
+  </div>
+  <div class="panel c-rose span-6">
+    <div class="panel-head"><div class="panel-title">TC-11 TPOT 随并发变化</div><div class="panel-tag">FIXED_IO · TPOT vs CONCURRENCY</div></div>
+    <div class="panel-sub">X轴：并发数 · Y轴：TPOT (ms) · 固定输入输出</div>
+    <div class="chart-box h-260"><canvas id="chartTC11TPOT"></canvas></div>
+  </div>
+  <div class="panel c-green span-12">
+    <div class="panel-head"><div class="panel-title">TC-11 Decode TPS 随并发变化</div><div class="panel-tag">FIXED_IO · DECODE_TPS vs CONCURRENCY</div></div>
+    <div class="panel-sub">X轴：并发数 · Y轴：Decode TPS (tok/s) · 固定输入输出</div>
+    <div class="chart-box h-260"><canvas id="chartTC11Decode"></canvas></div>
+  </div>'''
+
+def _render_tc11_kpis(has_data, d):
+    if not has_data:
+        return ""
+    lvs = d.get("levels", [])
+    if not lvs:
+        return ""
+    best = max(lvs, key=lambda l: float(l.get("tps_tokens", 0)))
+    best_c = best.get("concurrency", "?")
+    return f'<div class="kpi"><div class="k">TC-11 最高TPS</div><div class="v">{best.get("tps_tokens","?")}</div><div class="d">tok/s (并发={best_c}) · in={d.get("input_tokens","?")} out={d.get("max_tokens","?")}</div></div>'
+
+def _render_tc11_detail_table(has_data):
+    if not has_data:
+        return ""
+    return '''<!-- TC-11 并发梯度明细表 -->
+  <div class="panel c-amber span-12">
+    <div class="panel-head">
+      <div class="panel-title">TC-11 固定IO并发梯度明细</div>
+      <div class="panel-tag" id="tc11tableTag">CONCURRENCY SWEEP</div>
+    </div>
+    <div class="panel-sub" id="tc11tableSub">每个并发级别的详细指标</div>
+    <div style="max-height:500px; overflow-y:auto;">
+    <table>
+      <thead id="tc11thead">
+        <tr>
+          <th>并发</th><th>成功</th><th>失败</th><th>耗时</th>
+          <th>TPS</th><th>Decode TPS</th><th>Prefill TPS</th>
+          <th>TTFT</th><th>TPOT</th><th>延迟</th><th>总Tok</th><th>错误</th>
+        </tr>
+      </thead>
+      <tbody id="tc11tbody"></tbody>
+    </table>
+    </div>
+    <div class="pager">
+      <button id="tc11prev">← 上一页</button>
+      <span id="tc11page"></span>
+      <button id="tc11next">下一页 →</button>
+    </div>
+  </div>'''
+
 def _render_tc02_chart(has_data):
     if not has_data: return ""
     return '''<!-- TC-02 并发梯度 -->
@@ -3688,7 +4268,7 @@ def _case_metric(cid, d):
     if not d: return "未执行"
     if cid == "TC-01":
         return f"HTTP {d.get('status_code','?')} · {d.get('latency','?')}s"
-    elif cid == "TC-02":
+    elif cid in ("TC-02", "TC-11", "TC-12"):
         return f"最高 TPS {d.get('tps_tokens','?')} tok/s · Decode {d.get('decode_tps','?')} tok/s"
     elif cid == "TC-03":
         return f"TPS→TPM {'✅' if d.get('formula_ok') else '❌'}"
@@ -4042,6 +4622,458 @@ def _render_tc02_chart_js():
         }
       }
     });
+  }'''
+
+def _render_tc11_charts_js():
+    return '''
+  // ── TC-11 TTFT/TPOT/Decode TPS 随并发变化 ──
+  if (R.tc11 && R.tc11.levels && R.tc11.levels.length > 0) {
+    const lv = R.tc11.levels;
+    const labels = lv.map(l => "并发=" + l.concurrency);
+    const ttftData = lv.map(l => l.avg_ttft || 0);
+    const tpotData = lv.map(l => l.avg_tpot_ms || 0);
+    const decodeData = lv.map(l => parseFloat(l.decode_tps) || 0);
+    const tpsData = lv.map(l => parseFloat(l.tps_tokens) || 0);
+
+    new Chart(document.getElementById("chartTC11TTFT"), {
+      type: "line",
+      data: {
+        labels: labels,
+        datasets: [{
+          label: "TTFT (s)", data: ttftData,
+          borderColor: "#F0A868", backgroundColor: "rgba(240,168,104,0.1)",
+          fill: true, tension: 0.35, pointRadius: 4, pointBackgroundColor: "#F0A868", borderWidth: 2.5
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: "top", align: "end", labels: { boxWidth: 10, boxHeight: 10, padding: 12 } },
+          tooltip: { mode: "index", intersect: false },
+          datalabels: { display: false }
+        },
+        scales: {
+          x: { grid: { color: gridColor, drawTicks: false }, border: { color: "#232838" } },
+          y: { grid: { color: gridColor, drawTicks: false }, border: { color: "#232838" },
+            beginAtZero: true, title: { display: true, text: "秒 (s)", color: "#7C8499", font: { size: 10 } } }
+        }
+      }
+    });
+
+    new Chart(document.getElementById("chartTC11TPOT"), {
+      type: "line",
+      data: {
+        labels: labels,
+        datasets: [{
+          label: "TPOT (ms)", data: tpotData,
+          borderColor: "#F0708A", backgroundColor: "rgba(240,112,138,0.1)",
+          fill: true, tension: 0.35, pointRadius: 4, pointBackgroundColor: "#F0708A", borderWidth: 2.5
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: "top", align: "end", labels: { boxWidth: 10, boxHeight: 10, padding: 12 } },
+          tooltip: { mode: "index", intersect: false },
+          datalabels: { display: false }
+        },
+        scales: {
+          x: { grid: { color: gridColor, drawTicks: false }, border: { color: "#232838" } },
+          y: { grid: { color: gridColor, drawTicks: false }, border: { color: "#232838" },
+            beginAtZero: true, title: { display: true, text: "ms", color: "#7C8499", font: { size: 10 } } }
+        }
+      }
+    });
+
+    new Chart(document.getElementById("chartTC11Decode"), {
+      type: "bar",
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            type: "bar", label: "TPS (tok/s)", data: tpsData,
+            backgroundColor: "rgba(111,217,140,0.18)", borderColor: "rgba(111,217,140,0.4)",
+            borderWidth: 1, borderRadius: 3, maxBarThickness: 32, yAxisID: "y"
+          },
+          {
+            type: "line", label: "Decode TPS (tok/s)", data: decodeData,
+            fill: false, tension: 0.35, borderColor: "#6FD98C", pointRadius: 4,
+            pointBackgroundColor: "#6FD98C", borderWidth: 2.5, yAxisID: "y1"
+          }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: "top", align: "end", labels: { boxWidth: 10, boxHeight: 10, padding: 12 } },
+          tooltip: { mode: "index", intersect: false },
+          datalabels: { display: false }
+        },
+        scales: {
+          x: { grid: { color: gridColor, drawTicks: false }, border: { color: "#232838" } },
+          y: { grid: { color: gridColor, drawTicks: false }, border: { color: "#232838" },
+            beginAtZero: true, title: { display: true, text: "TPS (tok/s)", color: "#7C8499", font: { size: 10 } } },
+          y1: { position: "right", beginAtZero: true, grid: { drawOnChartArea: false },
+            border: { color: "#232838" }, title: { display: true, text: "Decode TPS", color: "#7C8499", font: { size: 10 } } }
+        }
+      }
+    });
+  }'''
+
+def _render_tc11_table_js():
+    return '''
+  // ── TC-11 并发梯度明细分页 ──
+  if (R.tc11 && R.tc11.levels && R.tc11.levels.length > 0) {
+    const lv = R.tc11.levels;
+    const tbody = document.getElementById("tc11tbody");
+    const pageSize = 20;
+    let page = 0;
+    const totalPages = Math.ceil(lv.length / pageSize);
+    const pageInfo = document.getElementById("tc11page");
+    const prevBtn = document.getElementById("tc11prev");
+    const nextBtn = document.getElementById("tc11next");
+    const tag = document.getElementById("tc11tableTag");
+    const sub = document.getElementById("tc11tableSub");
+    if (tag) tag.textContent = "FIXED_IO · " + lv.length + " LEVELS";
+    if (sub) sub.textContent = "固定 in=" + (R.tc11.input_tokens || "?") + " out=" + (R.tc11.max_tokens || "?") + " · 并发梯度";
+    function renderPage() {
+      tbody.innerHTML = "";
+      const start = page * pageSize;
+      const end = Math.min(start + pageSize, lv.length);
+      for (let i = start; i < end; i++) {
+        const l = lv[i];
+        const ec = l.error_counts || {};
+        const es = Object.keys(ec).length > 0
+          ? Object.entries(ec).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([c, n]) => c + "×" + n).join(", ")
+          : "-";
+        const row = document.createElement("tr");
+        row.innerHTML =
+          "<td>" + l.concurrency + "</td>" +
+          "<td>" + l.ok + "</td>" +
+          "<td>" + l.fail + "</td>" +
+          "<td>" + l.elapsed + "s</td>" +
+          "<td>" + l.tps_tokens + "</td>" +
+          "<td>" + l.decode_tps + "</td>" +
+          "<td>" + (l.prefill_tps || "N/A") + "</td>" +
+          "<td>" + (l.avg_ttft || "N/A") + "s</td>" +
+          "<td>" + (l.avg_tpot_ms || "N/A") + "ms</td>" +
+          "<td>" + l.avg_latency + "s</td>" +
+          "<td>" + l.total_tokens + "</td>" +
+          "<td>" + es + "</td>";
+        tbody.appendChild(row);
+      }
+      pageInfo.textContent = (page + 1) + " / " + totalPages;
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = page >= totalPages - 1;
+    }
+    prevBtn.onclick = function () { if (page > 0) { page--; renderPage(); } };
+    nextBtn.onclick = function () { if (page < totalPages - 1) { page++; renderPage(); } };
+    renderPage();
+  }'''
+
+def _render_tc12_kpis(has_data, d):
+    if not has_data:
+        return ""
+    return f'''<div class="kpi"><div class="k">TC-12 TTFT P50</div><div class="v">{d.get('ttft_p50', '?')}s</div><div class="d">正态分布IO · P99={d.get('ttft_p99', '?')}s</div></div>
+  <div class="kpi"><div class="k">TC-12 Decode P50</div><div class="v">{d.get('decode_tps_p50', '?')}</div><div class="d">tok/s · P99={d.get('decode_tps_p99', '?')}</div></div>
+  <div class="kpi"><div class="k">TC-12 TPOT P50</div><div class="v">{d.get('tpot_p50_ms', '?')}</div><div class="d">ms · P99={d.get('tpot_p99_ms', '?')}ms</div></div>'''
+
+def _render_tc12_charts(has_data):
+    if not has_data:
+        return '''<!-- TC-12 未运行 -->
+  <div class="panel c-cyan span-12">
+    <div class="panel-head"><div class="panel-title">TC-12 正态分布混合IO性能</div><div class="panel-tag">NOT RUN</div></div>
+    <div class="panel-sub">未运行 TC-12 测试</div>
+  </div>'''
+    return '''<!-- TC-12 Input Tokens 分位数 -->
+  <div class="panel c-cyan span-6">
+    <div class="panel-head"><div class="panel-title">Input Tokens 分位数</div><div class="panel-tag">NORMAL_DIST · INPUT</div></div>
+    <div class="panel-sub" id="tc12inSub">单位：tokens · 对数正态分布拟合</div>
+    <div class="chart-box h-260"><canvas id="chartTC12Input"></canvas></div>
+  </div>
+  <!-- TC-12 Output Tokens 分位数 -->
+  <div class="panel c-violet span-6">
+    <div class="panel-head"><div class="panel-title">Output Tokens 分位数</div><div class="panel-tag">NORMAL_DIST · OUTPUT</div></div>
+    <div class="panel-sub" id="tc12outSub">单位：tokens · 与输入正相关</div>
+    <div class="chart-box h-260"><canvas id="chartTC12Output"></canvas></div>
+  </div>
+  <!-- TC-12 TTFT 分位数 -->
+  <div class="panel c-amber span-6">
+    <div class="panel-head"><div class="panel-title">TTFT 首响时延分位数</div><div class="panel-tag">NORMAL_DIST · TTFT</div></div>
+    <div class="panel-sub">单位：秒 · P50 / P75 / P90 / P99</div>
+    <div class="chart-box h-260"><canvas id="chartTC12TTFT"></canvas></div>
+  </div>
+  <!-- TC-12 TPOT 分位数 -->
+  <div class="panel c-rose span-6">
+    <div class="panel-head"><div class="panel-title">TPOT Decode 速度分位数</div><div class="panel-tag">NORMAL_DIST · TPOT</div></div>
+    <div class="panel-sub">单位：ms · P50 / P75 / P90 / P99</div>
+    <div class="chart-box h-260"><canvas id="chartTC12TPOT"></canvas></div>
+  </div>
+  <!-- TC-12 Decode TPS 分位数 -->
+  <div class="panel c-green span-6">
+    <div class="panel-head"><div class="panel-title">Decode TPS 分位数</div><div class="panel-tag">NORMAL_DIST · DECODE_TPS</div></div>
+    <div class="panel-sub">单位：tok/s · P50 / P75 / P90 / P99</div>
+    <div class="chart-box h-260"><canvas id="chartTC12Decode"></canvas></div>
+  </div>'''
+
+def _render_tc12_error_summary(has_data):
+    if not has_data:
+        return ""
+    return '''<!-- TC-12 错误分布 -->
+  <div class="panel c-rose span-12">
+    <div class="panel-head">
+      <div class="panel-title">TC-12 错误分布</div>
+      <div class="panel-tag" id="tc12errTag">ERROR SUMMARY</div>
+    </div>
+    <div class="panel-sub" id="tc12errSub">按错误类型分类统计</div>
+    <div style="max-height:300px; overflow-y:auto;">
+    <table>
+      <thead><tr><th>错误码</th><th>错误类型</th><th>次数</th><th>占比</th></tr></thead>
+      <tbody id="tc12errBody"></tbody>
+    </table>
+    <div id="tc12errEmpty" style="display:none; padding:12px; color:var(--muted);">无错误 ✅</div>
+    </div>
+  </div>'''
+
+def _render_tc12_error_js():
+    return '''
+  // ── TC-12 错误分布 ──
+  if (R.tc12 && R.tc12.requests && R.tc12.requests.length > 0) {
+    const reqs = R.tc12.requests;
+    const errMap = {};
+    let errTotal = 0;
+    for (const r of reqs) {
+      if (r.status === "fail" || r.error) {
+        const errMsg = r.error || "未知错误";
+        const codeMatch = errMsg.match(/^HTTP\\s+(\\d+)/);
+        const code = codeMatch ? codeMatch[1] : (r.status === "fail" ? "FAIL" : "-");
+        const type = errMsg.substring(0, 80);
+        const key = code + "|" + type;
+        errMap[key] = (errMap[key] || 0) + 1;
+        errTotal++;
+      }
+    }
+    const tbody = document.getElementById("tc12errBody");
+    const empty = document.getElementById("tc12errEmpty");
+    const tag = document.getElementById("tc12errTag");
+    if (tag) tag.textContent = "ERRORS: " + errTotal + "/" + reqs.length;
+    if (errTotal === 0) {
+      if (empty) empty.style.display = "block";
+      if (tbody) tbody.innerHTML = "";
+    } else {
+      if (empty) empty.style.display = "none";
+      const sorted = Object.entries(errMap).sort((a, b) => b[1] - a[1]);
+      if (tbody) tbody.innerHTML = sorted.map(([key, n]) => {
+        const [code, type] = key.split("|");
+        return "<tr><td>" + code + "</td><td>" + type + "</td><td>" + n + "</td><td>" + (n / reqs.length * 100).toFixed(1) + "%</td></tr>";
+      }).join("");
+    }
+  }'''
+
+def _render_tc12_detail_table(has_data):
+    if not has_data:
+        return ""
+    return '''<!-- TC-12 请求明细表 -->
+  <div class="panel c-cyan span-12">
+    <div class="panel-head">
+      <div class="panel-title">TC-12 请求明细</div>
+      <div class="panel-tag" id="tc12tableTag">NORMAL_DIST SAMPLES</div>
+    </div>
+    <div class="panel-sub" id="tc12tableSub">字段见下表，每页 20 条</div>
+    <div style="max-height:500px; overflow-y:auto;">
+    <table>
+      <thead id="tc12thead">
+        <tr>
+          <th>#</th><th>输入</th><th>输出</th><th>状态</th>
+          <th>TTFT</th><th>Decode TPS</th><th>TPOT</th><th>ITL max</th>
+        </tr>
+      </thead>
+      <tbody id="tc12tbody"></tbody>
+    </table>
+    </div>
+    <div class="pager">
+      <button id="tc12prev">← 上一页</button>
+      <span id="tc12page"></span>
+      <button id="tc12next">下一页 →</button>
+    </div>
+  </div>'''
+
+def _render_tc12_charts_js():
+    return '''
+  // ── TC-12 正态分布IO图表 ──
+  if (R.tc12 && R.tc12.requests && R.tc12.requests.length > 0) {
+    const d = R.tc12;
+    // Input Tokens 分位数
+    document.getElementById("tc12inSub").textContent =
+      `P50=${d.in_p50.toLocaleString()} · avg=${d.in_avg.toLocaleString()} · P90=${d.in_p90.toLocaleString()} · P99=${d.in_p99.toLocaleString()} tokens`;
+    new Chart(document.getElementById("chartTC12Input"), {
+      type: "bar",
+      data: {
+        labels: ["P50", "AVG", "P90", "P99"],
+        datasets: [{
+          data: [d.in_p50, d.in_avg, d.in_p90, d.in_p99],
+          backgroundColor: c => barGradient(c.chart.ctx, "rgba(79,216,196,0.9)", "rgba(79,216,196,0.2)"),
+          borderRadius: 4, borderSkipped: false, maxBarThickness: 52
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: i => " " + i.formattedValue + " tokens" } },
+          datalabels: { display: true, anchor: "end", align: "top", offset: 2,
+            color: "#9FA6B8", font: { size: 10 },
+            formatter: v => v >= 1000 ? (v/1000).toFixed(1)+"K" : v }
+        },
+        scales: commonScales({ title: { display: true, text: "tokens", color: "#7C8499", font: { size: 10 } } })
+      }
+    });
+
+    // Output Tokens 分位数
+    document.getElementById("tc12outSub").textContent =
+      `P50=${d.out_p50.toLocaleString()} · avg=${d.out_avg.toLocaleString()} · P90=${d.out_p90.toLocaleString()} · P99=${d.out_p99.toLocaleString()} tokens`;
+    new Chart(document.getElementById("chartTC12Output"), {
+      type: "bar",
+      data: {
+        labels: ["P50", "AVG", "P90", "P99"],
+        datasets: [{
+          data: [d.out_p50, d.out_avg, d.out_p90, d.out_p99],
+          backgroundColor: c => barGradient(c.chart.ctx, "rgba(154,140,255,0.9)", "rgba(154,140,255,0.2)"),
+          borderRadius: 4, borderSkipped: false, maxBarThickness: 52
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: i => " " + i.formattedValue + " tokens" } },
+          datalabels: { display: true, anchor: "end", align: "top", offset: 2,
+            color: "#9FA6B8", font: { size: 10 },
+            formatter: v => v >= 1000 ? (v/1000).toFixed(1)+"K" : v }
+        },
+        scales: commonScales({ title: { display: true, text: "tokens", color: "#7C8499", font: { size: 10 } } })
+      }
+    });
+
+    // TTFT 分位数
+    new Chart(document.getElementById("chartTC12TTFT"), {
+      type: "bar",
+      data: {
+        labels: ["P50", "P75", "P90", "P99"],
+        datasets: [{
+          label: "实测值",
+          data: [d.ttft_p50, d.ttft_p75, d.ttft_p90, d.ttft_p99],
+          backgroundColor: c => barGradient(c.chart.ctx, "rgba(240,168,104,0.9)", "rgba(240,168,104,0.2)"),
+          borderRadius: 4, borderSkipped: false, maxBarThickness: 44
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: i => " " + i.formattedValue + "s" } },
+          datalabels: { display: true, anchor: "end", align: "top", offset: 2,
+            color: "#9FA6B8", font: { size: 10 }, formatter: v => v + "s" }
+        },
+        scales: commonScales({ title: { display: true, text: "秒 (s)", color: "#7C8499", font: { size: 10 } } })
+      }
+    });
+
+    // TPOT 分位数
+    new Chart(document.getElementById("chartTC12TPOT"), {
+      type: "bar",
+      data: {
+        labels: ["P50", "P75", "P90", "P99"],
+        datasets: [{
+          label: "实测值",
+          data: [d.tpot_p50_ms, d.tpot_p75_ms, d.tpot_p90_ms, d.tpot_p99_ms],
+          backgroundColor: c => barGradient(c.chart.ctx, "rgba(240,112,138,0.9)", "rgba(240,112,138,0.2)"),
+          borderRadius: 4, borderSkipped: false, maxBarThickness: 44
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: i => " " + i.formattedValue + " ms" } },
+          datalabels: { display: true, anchor: "end", align: "top", offset: 2,
+            color: "#9FA6B8", font: { size: 10 }, formatter: v => v + "ms" }
+        },
+        scales: commonScales({ title: { display: true, text: "ms", color: "#7C8499", font: { size: 10 } } })
+      }
+    });
+
+    // Decode TPS 分位数（由 TPOT 换算: TPS = 1000 / TPOT_ms）
+    const decodeP50 = d.tpot_p50_ms > 0 ? Math.round(1000 / d.tpot_p50_ms * 10) / 10 : 0;
+    const decodeP75 = d.tpot_p75_ms > 0 ? Math.round(1000 / d.tpot_p75_ms * 10) / 10 : 0;
+    const decodeP90 = d.tpot_p90_ms > 0 ? Math.round(1000 / d.tpot_p90_ms * 10) / 10 : 0;
+    const decodeP99 = d.tpot_p99_ms > 0 ? Math.round(1000 / d.tpot_p99_ms * 10) / 10 : 0;
+    new Chart(document.getElementById("chartTC12Decode"), {
+      type: "bar",
+      data: {
+        labels: ["P50", "P75", "P90", "P99"],
+        datasets: [{
+          label: "实测值",
+          data: [decodeP50, decodeP75, decodeP90, decodeP99],
+          backgroundColor: c => barGradient(c.chart.ctx, "rgba(111,217,140,0.9)", "rgba(111,217,140,0.2)"),
+          borderRadius: 4, borderSkipped: false, maxBarThickness: 44
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: i => " " + i.formattedValue + " tok/s" } },
+          datalabels: { display: true, anchor: "end", align: "top", offset: 2,
+            color: "#9FA6B8", font: { size: 10 }, formatter: v => v + " tok/s" }
+        },
+        scales: commonScales({ title: { display: true, text: "tok/s", color: "#7C8499", font: { size: 10 } } })
+      }
+    });
+  }'''
+
+def _render_tc12_table_js():
+    return '''
+  // ── TC-12 请求明细分页 ──
+  if (R.tc12 && R.tc12.requests && R.tc12.requests.length > 0) {
+    const reqs = R.tc12.requests;
+    const tbody = document.getElementById("tc12tbody");
+    const pageSize = 20;
+    let page = 0;
+    const totalPages = Math.ceil(reqs.length / pageSize);
+    const pageInfo = document.getElementById("tc12page");
+    const prevBtn = document.getElementById("tc12prev");
+    const nextBtn = document.getElementById("tc12next");
+    const tag = document.getElementById("tc12tableTag");
+    const sub = document.getElementById("tc12tableSub");
+    if (tag) tag.textContent = "NORMAL_DIST · " + reqs.length + " SAMPLES";
+    if (sub) sub.textContent = "对数正态分布拟合 (ρ=" + (R.tc12.correlation || "?") + ") · in: P50=50K P90=160K P99=380K";
+    function renderPage() {
+      tbody.innerHTML = "";
+      const start = page * pageSize;
+      const end = Math.min(start + pageSize, reqs.length);
+      for (let i = start; i < end; i++) {
+        const r = reqs[i];
+        const st = r.status === "ok" ? "✅" : (r.status === "skipped" ? "⏭" : "❌");
+        const row = document.createElement("tr");
+        row.innerHTML =
+          "<td>" + r.seq + "</td>" +
+          "<td>" + r.input_tokens.toLocaleString() + "</td>" +
+          "<td>" + r.output_tokens.toLocaleString() + "</td>" +
+          "<td>" + st + "</td>" +
+          "<td>" + (r.ttft || 0) + "s</td>" +
+          "<td>" + (r.decode_tps || 0) + "</td>" +
+          "<td>" + (r.tpot_ms || 0) + "ms</td>" +
+          "<td>" + (r.itl_max_ms || 0) + "ms</td>";
+        tbody.appendChild(row);
+      }
+      pageInfo.textContent = (page + 1) + " / " + totalPages;
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = page >= totalPages - 1;
+    }
+    prevBtn.onclick = function () { if (page > 0) { page--; renderPage(); } };
+    nextBtn.onclick = function () { if (page < totalPages - 1) { page++; renderPage(); } };
+    renderPage();
   }'''
 
 def _render_tc10_table_js():
@@ -4538,6 +5570,16 @@ def main():
     if args.tc_filter or args.tc_exclude:
         print()
 
+    # ── TC-12 命令行参数覆盖 ──
+    for c in cases:
+        if c["id"] == "TC-12" and c.get("method") == "normal_dist_io_benchmark":
+            p = c.setdefault("params", {})
+            if args.io_concurrency is not None:
+                p["concurrency"] = args.io_concurrency
+            if args.io_requests is not None:
+                p["total_requests"] = args.io_requests
+            break
+
     # 检查 Key
     key = cfg["api"].get("key", "")
     if not key or key == "sk-your-api-key-here":
@@ -4549,6 +5591,7 @@ def main():
     methods = {
         "connectivity": test_connectivity,
         "tps_benchmark": test_tps_benchmark,
+        "fixed_io_concurrency_sweep": test_fixed_io_concurrency_sweep,
         "tpm_calc": test_tpm_calc,
         "context_limit": test_context_limit,
         "auth_failure": test_auth_failure,
@@ -4559,6 +5602,7 @@ def main():
         "io_sweep_benchmark": test_io_sweep_benchmark,
         "io_tier_benchmark": test_io_tier_benchmark,
         "io_mix_benchmark": test_io_mix_benchmark,
+        "normal_dist_io_benchmark": test_normal_dist_io_benchmark,
     }
 
     results = []
